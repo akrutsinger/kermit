@@ -66,64 +66,66 @@ pub enum ProtoError {
     Mac,
     NoncePresent,
     Io,
+    Init,
 }
 
-#[cfg(debug_assertions)]
 impl std::fmt::Display for ProtoError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(debug_assertions)]
+        _f.write_str(match self {
             ProtoError::TooShort => "input too short",
             ProtoError::Mac => "mac verification failed",
             ProtoError::NoncePresent => "nonce already present (replay detected)",
             ProtoError::Io => "nonce-file i/o failed",
-        })
+            ProtoError::Init => "crypto primitive init failed",
+        })?;
+        Ok(())
     }
 }
-#[cfg(debug_assertions)]
+
 impl std::error::Error for ProtoError {}
 
 pub trait Protocol {
-    fn seal(&self, msg: &[u8]) -> Vec<u8>;
+    fn seal(&self, msg: &[u8]) -> Result<Vec<u8>, ProtoError>;
     fn open(&self, wire: &[u8]) -> Result<Vec<u8>, ProtoError>;
     /// Fixed per-message wire expansion in bytes (computed from the primitives,
     /// not measured). Constant because every cipher here is stream/CTR-based.
     fn overhead(&self) -> usize;
-    fn guarantees(&self) -> &'static str;
 }
 
 // ============================================================================
 // Shared primitives
 // ============================================================================
 
-fn derive_key(base_key: &[u8], label: &[u8]) -> [u8; 32] {
+fn derive_key(base_key: &[u8], label: &[u8]) -> Result<[u8; 32], ProtoError> {
     let mut k = [0u8; 32];
     Hkdf::<Sha256>::new(None, base_key)
         .expand(label, &mut k)
-        .expect("32 <= 255*32");
-    k
+        .map_err(|_| ProtoError::Init)?;
+    Ok(k)
 }
 
-pub fn derive_enc_key(base_key: &[u8]) -> [u8; 32] {
+pub fn derive_enc_key(base_key: &[u8]) -> Result<[u8; 32], ProtoError> {
     derive_key(base_key, b"seal:enc-key:v1")
 }
 
 /// Separate HMAC key from the same base, distinct HKDF label (key separation).
-pub fn derive_mac_key(base_key: &[u8]) -> [u8; 32] {
+pub fn derive_mac_key(base_key: &[u8]) -> Result<[u8; 32], ProtoError> {
     derive_key(base_key, b"seal:mac-key:v1")
 }
 
 /// HMAC-SHA256 over `data`, truncated to the leftmost `n` bytes.
-fn mac_tag(mac_key: &[u8], data: &[u8], n: usize) -> Vec<u8> {
-    let mut m = Hmac::<Sha256>::new_from_slice(mac_key).expect("any key length");
+fn mac_tag(mac_key: &[u8], data: &[u8], n: usize) -> Result<Vec<u8>, ProtoError> {
+    let mut m = Hmac::<Sha256>::new_from_slice(mac_key).map_err(|_| ProtoError::Init)?;
     m.update(data);
-    m.finalize().into_bytes()[..n].to_vec()
+    Ok(m.finalize().into_bytes()[..n].to_vec())
 }
 
 /// Constant-time verify of a left-truncated HMAC-SHA256 tag.
-fn mac_verify(mac_key: &[u8], data: &[u8], tag: &[u8]) -> bool {
-    let mut m = Hmac::<Sha256>::new_from_slice(mac_key).expect("any key length");
+fn mac_verify(mac_key: &[u8], data: &[u8], tag: &[u8]) -> Result<(), ProtoError> {
+    let mut m = Hmac::<Sha256>::new_from_slice(mac_key).map_err(|_| ProtoError::Init)?;
     m.update(data);
-    m.verify_truncated_left(tag).is_ok()
+    m.verify_truncated_left(tag).map_err(|_| ProtoError::Mac)
 }
 
 /// Zero-pad `short` up to the cipher's full nonce width. Entropy stays at `short.len()` bytes --
@@ -144,11 +146,15 @@ fn siv_iv<S: KeyIvInit>(tag: &[u8], n: usize) -> Vec<u8> {
     expand_short_nonce(iv_len, &tag[..n.min(iv_len)])
 }
 
-fn stream_open<S: KeyIvInit + StreamCipher>(key: &[u8], iv: &[u8], ct: &[u8]) -> Vec<u8> {
+fn stream_open<S: KeyIvInit + StreamCipher>(
+    key: &[u8],
+    iv: &[u8],
+    ct: &[u8],
+) -> Result<Vec<u8>, ProtoError> {
     let mut buf = ct.to_vec();
-    let mut c = S::new_from_slices(key, iv).expect("key/iv length");
+    let mut c = S::new_from_slices(key, iv).map_err(|_| ProtoError::Init)?;
     c.apply_keystream(&mut buf);
-    buf
+    Ok(buf)
 }
 
 /// Application-layer framing: append an 8-byte replay nonce to the message. Called ONCE by the
@@ -168,27 +174,28 @@ pub fn to_base64(data: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(data)
 }
 
-/// Check the `/tmp/nonce` ring buffer for `nonce`; return `Err(NoncePresent)` if found,
-/// otherwise record it and return `Ok(())`.
+/// Check the `/tmp/nonce` ring buffer for `nonce`; return `Err(NoncePresent)` if found, otherwise
+/// record it and return `Ok(())`.
 ///
-/// On-disk layout: 33 bytes of ChaCha20-encrypted ring buffer. Fixed zero IV is safe because
-/// the derived key is unique per session. Plaintext layout: `[head: u8][slot_0..slot_N-1]`.
+/// On-disk layout: 33 bytes of ChaCha20-encrypted ring buffer. Fixed zero IV is safe because the
+/// derived key is unique per session. Plaintext layout: `[head: u8][slot_0..slot_N-1]`.
 pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), ProtoError> {
     let n = nonce.len();
     let file_len = 1 + NONCE_WINDOW * n;
-    let file_key = derive_key(base_key, b"nonce-file:key:v1");
+    let file_key = derive_key(base_key, b"nonce-file:key:v1")?;
     let iv = vec![0u8; ChaCha20::iv_size()];
 
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open("/tmp/nonce")
         .map_err(|_| ProtoError::Io)?;
 
     let mut ring = vec![0u8; file_len];
     if file.read(&mut ring).map_err(|_| ProtoError::Io)? == file_len {
-        ring = stream_open::<ChaCha20>(&file_key, &iv, &ring);
+        ring = stream_open::<ChaCha20>(&file_key, &iv, &ring)?;
     }
 
     let head = (ring[0] as usize) % NONCE_WINDOW;
@@ -203,7 +210,7 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
     ring[0] = ((head + 1) % NONCE_WINDOW) as u8;
 
     file.seek(SeekFrom::Start(0)).map_err(|_| ProtoError::Io)?;
-    file.write_all(&stream_open::<ChaCha20>(&file_key, &iv, &ring))
+    file.write_all(&stream_open::<ChaCha20>(&file_key, &iv, &ring)?)
         .map_err(|_| ProtoError::Io)?;
     Ok(())
 }
@@ -240,27 +247,30 @@ pub struct StreamSiv<S, const N: usize> {
     mac_key: [u8; 32],
     _p: PhantomData<S>,
 }
+
 impl<S, const N: usize> StreamSiv<S, N> {
-    pub fn new(base_key: &[u8]) -> Self {
-        Self {
-            enc_key: derive_enc_key(base_key),
-            mac_key: derive_mac_key(base_key),
+    pub fn new(base_key: &[u8]) -> Result<Self, ProtoError> {
+        Ok(Self {
+            enc_key: derive_enc_key(base_key)?,
+            mac_key: derive_mac_key(base_key)?,
             _p: PhantomData,
-        }
+        })
     }
 }
+
 impl<S: KeyIvInit + StreamCipher, const N: usize> Protocol for StreamSiv<S, N> {
-    fn seal(&self, msg: &[u8]) -> Vec<u8> {
-        let tag = mac_tag(&self.mac_key, msg, N); // MAC over the message
-        let iv = siv_iv::<S>(&tag, N); // synthetic IV, zero-padded if N < iv_len
+    fn seal(&self, msg: &[u8]) -> Result<Vec<u8>, ProtoError> {
+        let tag = mac_tag(&self.mac_key, msg, N)?;
+        let iv = siv_iv::<S>(&tag, N);
         let mut ct = msg.to_vec();
         S::new_from_slices(&self.enc_key, &iv)
-            .expect("key/iv length")
+            .map_err(|_| ProtoError::Init)?
             .apply_keystream(&mut ct);
         let mut wire = tag;
-        wire.extend_from_slice(&ct); // tag || ct
-        wire
+        wire.extend_from_slice(&ct);
+        Ok(wire)
     }
+
     fn open(&self, wire: &[u8]) -> Result<Vec<u8>, ProtoError> {
         if wire.len() < N {
             return Err(ProtoError::TooShort);
@@ -269,20 +279,13 @@ impl<S: KeyIvInit + StreamCipher, const N: usize> Protocol for StreamSiv<S, N> {
         let iv = siv_iv::<S>(tag, N);
         let mut buf = ct.to_vec();
         S::new_from_slices(&self.enc_key, &iv)
-            .expect("key/iv length")
-            .apply_keystream(&mut buf); // recover plaintext
-        // Recompute the MAC over the recovered plaintext; constant-time check
-        // that its leading N bytes equal the tag we used as the IV seed. A flip
-        // in either the tag or the ciphertext breaks this.
-        if !mac_verify(&self.mac_key, &buf, tag) {
-            return Err(ProtoError::Mac);
-        }
+            .map_err(|_| ProtoError::Init)?
+            .apply_keystream(&mut buf);
+        mac_verify(&self.mac_key, &buf, tag)?;
         Ok(buf)
     }
+
     fn overhead(&self) -> usize {
         N
-    }
-    fn guarantees(&self) -> &'static str {
-        "conf + integrity (sym-auth); stateless SIV; N-byte tag also seeds IV"
     }
 }
