@@ -41,14 +41,12 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 
-use aead::generic_array::typenum::Unsigned;
-use aead::{AeadCore, AeadInPlace, KeyInit, Nonce, Tag};
+// use aead::KeyInit;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20::ChaCha20;
-use cipher::{KeyIvInit, StreamCipher};
-use ed25519_dalek::{SIGNATURE_LENGTH, Signature, Signer, SigningKey, VerifyingKey};
+use cipher::{IvSizeUser, KeyIvInit, StreamCipher};
 use hkdf::Hkdf;
-use hmac::{Hmac, KeyInit as _, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 
@@ -57,8 +55,6 @@ pub const NONCE_WINDOW: usize = 4;
 /// Length of the application-layer replay nonce that the driver prepends before sealing. This nonce
 /// is also stored in a file to detect replays.
 pub const APP_NONCE_LEN: usize = 8;
-const SHORT_NONCE_LEN: usize = 4; // random bytes shipped by SivShortNonce
-const SIG_LEN: usize = SIGNATURE_LENGTH; // 64
 
 // ============================================================================
 // Errors + the unifying trait
@@ -67,31 +63,28 @@ const SIG_LEN: usize = SIGNATURE_LENGTH; // 64
 #[derive(Debug, PartialEq)]
 pub enum ProtoError {
     TooShort,
-    Aead,
     Mac,
-    Signature,
     NoncePresent,
     Io,
 }
 
+#[cfg(debug_assertions)]
 impl std::fmt::Display for ProtoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             ProtoError::TooShort => "input too short",
-            ProtoError::Aead => "aead authentication failed",
             ProtoError::Mac => "mac verification failed",
-            ProtoError::Signature => "signature verification failed",
             ProtoError::NoncePresent => "nonce already present (replay detected)",
             ProtoError::Io => "nonce-file i/o failed",
         })
     }
 }
+#[cfg(debug_assertions)]
 impl std::error::Error for ProtoError {}
 
 pub trait Protocol {
     fn seal(&self, msg: &[u8]) -> Vec<u8>;
     fn open(&self, wire: &[u8]) -> Result<Vec<u8>, ProtoError>;
-    fn name(&self) -> &'static str;
     /// Fixed per-message wire expansion in bytes (computed from the primitives,
     /// not measured). Constant because every cipher here is stream/CTR-based.
     fn overhead(&self) -> usize;
@@ -133,41 +126,6 @@ fn mac_verify(mac_key: &[u8], data: &[u8], tag: &[u8]) -> bool {
     m.verify_truncated_left(tag).is_ok()
 }
 
-fn aead_nonce_len<A: AeadCore>() -> usize {
-    <A::NonceSize as Unsigned>::USIZE
-}
-fn aead_tag_len<A: AeadCore>() -> usize {
-    <A::TagSize as Unsigned>::USIZE
-}
-pub fn stream_iv_len<S: KeyIvInit>() -> usize {
-    <S::IvSize as Unsigned>::USIZE
-}
-
-/// AEAD seal with a caller-supplied nonce -> (ciphertext, tag), detached tag.
-pub fn aead_seal_with_nonce<A: KeyInit + AeadCore + AeadInPlace>(
-    key: &[u8],
-    nonce: &[u8],
-    pt: &[u8],
-) -> (Vec<u8>, Vec<u8>) {
-    let cipher = A::new_from_slice(key).expect("32-byte key");
-    let mut buf = pt.to_vec();
-    let tag = cipher
-        .encrypt_in_place_detached(Nonce::<A>::from_slice(nonce), b"", &mut buf)
-        .expect("encrypt");
-    (buf, tag.to_vec())
-}
-
-/// AEAD seal with a fresh random IV -> (iv, ciphertext, tag).
-fn aead_seal<A: KeyInit + AeadCore + AeadInPlace>(
-    key: &[u8],
-    pt: &[u8],
-) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let mut iv = vec![0u8; aead_nonce_len::<A>()];
-    OsRng.fill_bytes(&mut iv);
-    let (ct, tag) = aead_seal_with_nonce::<A>(key, &iv, pt);
-    (iv, ct, tag)
-}
-
 /// Zero-pad `short` up to the cipher's full nonce width. Entropy stays at `short.len()` bytes --
 /// that's the point: small wire cost, birthday-bounded collisions, which are non-catastrophic ONLY
 /// under a misuse-resistant AEAD.
@@ -182,37 +140,8 @@ fn expand_short_nonce(len: usize, short: &[u8]) -> Vec<u8> {
 /// bytes of entropy -- which is the whole point: shipping fewer tag bytes directly weakens
 /// nonce-collision resistance, because the receiver can only rebuild the IV from wire bytes.
 fn siv_iv<S: KeyIvInit>(tag: &[u8], n: usize) -> Vec<u8> {
-    let iv_len = stream_iv_len::<S>();
+    let iv_len = S::iv_size();
     expand_short_nonce(iv_len, &tag[..n.min(iv_len)])
-}
-
-fn aead_open<A: KeyInit + AeadCore + AeadInPlace>(
-    key: &[u8],
-    iv: &[u8],
-    ct: &[u8],
-    tag: &[u8],
-) -> Result<Vec<u8>, ProtoError> {
-    let cipher = A::new_from_slice(key).expect("32-byte key");
-    let mut buf = ct.to_vec();
-    cipher
-        .decrypt_in_place_detached(
-            Nonce::<A>::from_slice(iv),
-            b"",
-            &mut buf,
-            Tag::<A>::from_slice(tag),
-        )
-        .map_err(|_| ProtoError::Aead)?;
-    Ok(buf)
-}
-
-/// Raw stream cipher (no integrity) -> (iv, ciphertext). `open` is the same XOR.
-fn stream_seal<S: KeyIvInit + StreamCipher>(key: &[u8], pt: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let mut iv = vec![0u8; stream_iv_len::<S>()];
-    OsRng.fill_bytes(&mut iv);
-    let mut buf = pt.to_vec();
-    let mut c = S::new_from_slices(key, &iv).expect("key/iv length");
-    c.apply_keystream(&mut buf);
-    (iv, buf)
 }
 
 fn stream_open<S: KeyIvInit + StreamCipher>(key: &[u8], iv: &[u8], ct: &[u8]) -> Vec<u8> {
@@ -235,21 +164,6 @@ pub fn prepend_nonce(msg: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Verify the trailing ed25519 signature over the rest, returning the message
-/// with only the SIGNATURE stripped. Any app nonce is part of the message
-/// (folded in by the caller) and is left intact.
-fn verify_and_unsign(vk: &VerifyingKey, plaintext: &[u8]) -> Result<Vec<u8>, ProtoError> {
-    if plaintext.len() < SIG_LEN {
-        return Err(ProtoError::TooShort);
-    }
-    let sig_start = plaintext.len() - SIG_LEN;
-    let signed = &plaintext[..sig_start];
-    let sig_bytes: [u8; SIG_LEN] = plaintext[sig_start..].try_into().unwrap();
-    vk.verify_strict(signed, &Signature::from_bytes(&sig_bytes))
-        .map_err(|_| ProtoError::Signature)?;
-    Ok(signed.to_vec())
-}
-
 pub fn to_base64(data: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(data)
 }
@@ -263,7 +177,7 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
     let n = nonce.len();
     let file_len = 1 + NONCE_WINDOW * n;
     let file_key = derive_key(base_key, b"nonce-file:key:v1");
-    let iv = vec![0u8; stream_iv_len::<ChaCha20>()];
+    let iv = vec![0u8; ChaCha20::iv_size()];
 
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -292,315 +206,6 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
     file.write_all(&stream_open::<ChaCha20>(&file_key, &iv, &ring))
         .map_err(|_| ProtoError::Io)?;
     Ok(())
-}
-
-// ============================================================================
-// Variant 1: SignAead  (sign-then-encrypt, AEAD)
-//
-// Cost/benefit: the most expensive (+100B here) -- random IV + AEAD tag + a 64-byte ed25519
-// signature. Buys the full guarantee set: confidentiality, integrity, symmetric auth, AND
-// non-repudiation (a third party can prove who sent it). Worth it only when non-repudiation is
-// actually needed; otherwise the 64-byte signature is dead weight and AeadOnly gives the same
-// secrecy. ============================================================================
-
-pub struct SignAead<A> {
-    enc_key: [u8; 32],
-    signing: SigningKey,
-    verifying: VerifyingKey,
-    _p: PhantomData<A>,
-}
-impl<A> SignAead<A> {
-    pub fn new(base_key: &[u8], signing: SigningKey) -> Self {
-        let verifying = signing.verifying_key();
-        Self {
-            enc_key: derive_enc_key(base_key),
-            signing,
-            verifying,
-            _p: PhantomData,
-        }
-    }
-}
-impl<A: KeyInit + AeadCore + AeadInPlace> Protocol for SignAead<A> {
-    fn seal(&self, msg: &[u8]) -> Vec<u8> {
-        let mut buf = msg.to_vec();
-        let sig = self.signing.sign(msg); // over the message
-        buf.extend_from_slice(&sig.to_bytes());
-        let (iv, ct, tag) = aead_seal::<A>(&self.enc_key, &buf);
-        [iv, ct, tag].concat()
-    }
-    fn open(&self, wire: &[u8]) -> Result<Vec<u8>, ProtoError> {
-        let (iv_len, tag_len) = (aead_nonce_len::<A>(), aead_tag_len::<A>());
-        if wire.len() < iv_len + tag_len + SIG_LEN {
-            return Err(ProtoError::TooShort);
-        }
-        let iv = &wire[..iv_len];
-        let tag = &wire[wire.len() - tag_len..];
-        let ct = &wire[iv_len..wire.len() - tag_len];
-        let pt = aead_open::<A>(&self.enc_key, iv, ct, tag)?;
-        verify_and_unsign(&self.verifying, &pt)
-    }
-    fn name(&self) -> &'static str {
-        "SignAead"
-    }
-    fn overhead(&self) -> usize {
-        aead_nonce_len::<A>() + SIG_LEN + aead_tag_len::<A>()
-    }
-    fn guarantees(&self) -> &'static str {
-        "conf + integrity + sym-auth + non-repudiation"
-    }
-}
-
-// ============================================================================
-// Variant 2: SignStream  (sign-then-encrypt, raw stream cipher, no tag)
-//
-// Cost/benefit: drops the AEAD tag vs SignAead and leans on the signature alone for integrity,
-// saving the 16 tag bytes -- but still pays the 64-byte signature, so it is only marginally
-// smaller. Downside: integrity is verified ONLY after decrypting the whole message (no cheap
-// pre-decrypt reject of garbage). Non-repudiation without a symmetric tag.
-// ============================================================================
-
-pub struct SignStream<S> {
-    enc_key: [u8; 32],
-    signing: SigningKey,
-    verifying: VerifyingKey,
-    _p: PhantomData<S>,
-}
-impl<S> SignStream<S> {
-    pub fn new(base_key: &[u8], signing: SigningKey) -> Self {
-        let verifying = signing.verifying_key();
-        Self {
-            enc_key: derive_enc_key(base_key),
-            signing,
-            verifying,
-            _p: PhantomData,
-        }
-    }
-}
-impl<S: KeyIvInit + StreamCipher> Protocol for SignStream<S> {
-    fn seal(&self, msg: &[u8]) -> Vec<u8> {
-        let mut buf = msg.to_vec();
-        let sig = self.signing.sign(msg);
-        buf.extend_from_slice(&sig.to_bytes());
-        let (iv, ct) = stream_seal::<S>(&self.enc_key, &buf);
-        [iv, ct].concat()
-    }
-    fn open(&self, wire: &[u8]) -> Result<Vec<u8>, ProtoError> {
-        let iv_len = stream_iv_len::<S>();
-        if wire.len() < iv_len + SIG_LEN {
-            return Err(ProtoError::TooShort);
-        }
-        let pt = stream_open::<S>(&self.enc_key, &wire[..iv_len], &wire[iv_len..]);
-        // Integrity here comes ONLY from the signature (checked post-decrypt).
-        verify_and_unsign(&self.verifying, &pt)
-    }
-    fn name(&self) -> &'static str {
-        "SignStream"
-    }
-    fn overhead(&self) -> usize {
-        stream_iv_len::<S>() + SIG_LEN
-    }
-    fn guarantees(&self) -> &'static str {
-        "conf + integrity + non-repudiation (no pre-decrypt reject)"
-    }
-}
-
-// ============================================================================
-// Variant 3: AeadOnly  (AEAD, random IV, no signature)
-//
-// Cost/benefit: the textbook stateless choice -- conf + integrity + symmetric auth with a full
-// random IV shipped on the wire. No non-repudiation (anyone holding the key can forge, so the
-// receiver can't prove the sender). Robust and simple; the price is a full-width IV (12B) + tag
-// (16B) every message, with no nonce-management assumptions required of the caller.
-// ============================================================================
-
-pub struct AeadOnly<A> {
-    enc_key: [u8; 32],
-    _p: PhantomData<A>,
-}
-impl<A> AeadOnly<A> {
-    pub fn new(base_key: &[u8]) -> Self {
-        Self {
-            enc_key: derive_enc_key(base_key),
-            _p: PhantomData,
-        }
-    }
-}
-impl<A: KeyInit + AeadCore + AeadInPlace> Protocol for AeadOnly<A> {
-    fn seal(&self, msg: &[u8]) -> Vec<u8> {
-        let (iv, ct, tag) = aead_seal::<A>(&self.enc_key, msg);
-        [iv, ct, tag].concat()
-    }
-    fn open(&self, wire: &[u8]) -> Result<Vec<u8>, ProtoError> {
-        let (iv_len, tag_len) = (aead_nonce_len::<A>(), aead_tag_len::<A>());
-        if wire.len() < iv_len + tag_len {
-            return Err(ProtoError::TooShort);
-        }
-        let iv = &wire[..iv_len];
-        let tag = &wire[wire.len() - tag_len..];
-        let ct = &wire[iv_len..wire.len() - tag_len];
-        aead_open::<A>(&self.enc_key, iv, ct, tag)
-    }
-    fn name(&self) -> &'static str {
-        "AeadOnly"
-    }
-    fn overhead(&self) -> usize {
-        aead_nonce_len::<A>() + aead_tag_len::<A>()
-    }
-    fn guarantees(&self) -> &'static str {
-        "conf + integrity + sym-auth (no non-repudiation)"
-    }
-}
-
-// ============================================================================
-// Variant 4: StreamOnly  (raw stream cipher, random IV, no auth)
-//
-// Cost/benefit: confidentiality only. Ships a full random IV but NO tag, so it is malleable -- an
-// attacker flips ciphertext bits and the receiver can't tell (see the tamper test, which it
-// silently accepts). Cheaper than any authenticated variant only because it omits the one thing (a
-// tag) that makes a channel safe against active tampering. Useful as the "conf, no integrity"
-// baseline to measure the cost of authentication against.
-// ============================================================================
-
-pub struct StreamOnly<S> {
-    enc_key: [u8; 32],
-    _p: PhantomData<S>,
-}
-impl<S> StreamOnly<S> {
-    pub fn new(base_key: &[u8]) -> Self {
-        Self {
-            enc_key: derive_enc_key(base_key),
-            _p: PhantomData,
-        }
-    }
-}
-impl<S: KeyIvInit + StreamCipher> Protocol for StreamOnly<S> {
-    fn seal(&self, msg: &[u8]) -> Vec<u8> {
-        let (iv, ct) = stream_seal::<S>(&self.enc_key, msg);
-        [iv, ct].concat()
-    }
-    fn open(&self, wire: &[u8]) -> Result<Vec<u8>, ProtoError> {
-        let iv_len = stream_iv_len::<S>();
-        if wire.len() < iv_len {
-            return Err(ProtoError::TooShort);
-        }
-        // No integrity: this returns whatever the keystream produces, tampered
-        // or not.
-        Ok(stream_open::<S>(
-            &self.enc_key,
-            &wire[..iv_len],
-            &wire[iv_len..],
-        ))
-    }
-    fn name(&self) -> &'static str {
-        "StreamOnly"
-    }
-    fn overhead(&self) -> usize {
-        stream_iv_len::<S>()
-    }
-    fn guarantees(&self) -> &'static str {
-        "conf only (malleable, no replay defense)"
-    }
-}
-
-// ============================================================================
-// Variant 5: StreamRaw  (raw stream cipher, fixed zero IV, no auth)
-//
-// Nothing goes on the wire except the ciphertext itself -- same length as the message, 0 overhead.
-// The IV is all-zeros every message, so every seal uses the same keystream. Sending two messages
-// under the same key XORs their plaintexts into the observable wire difference. Purely illustrative
-// of the minimum possible wire cost; do not use for real traffic.
-// ============================================================================
-
-pub struct StreamRaw<S> {
-    enc_key: [u8; 32],
-    _p: PhantomData<S>,
-}
-impl<S> StreamRaw<S> {
-    pub fn new(base_key: &[u8]) -> Self {
-        Self {
-            enc_key: derive_enc_key(base_key),
-            _p: PhantomData,
-        }
-    }
-}
-impl<S: KeyIvInit + StreamCipher> Protocol for StreamRaw<S> {
-    fn seal(&self, msg: &[u8]) -> Vec<u8> {
-        let iv = vec![0u8; stream_iv_len::<S>()];
-        let mut buf = msg.to_vec();
-        S::new_from_slices(&self.enc_key, &iv)
-            .expect("key/iv length")
-            .apply_keystream(&mut buf);
-        buf
-    }
-    fn open(&self, wire: &[u8]) -> Result<Vec<u8>, ProtoError> {
-        let iv = vec![0u8; stream_iv_len::<S>()];
-        let mut buf = wire.to_vec();
-        S::new_from_slices(&self.enc_key, &iv)
-            .expect("key/iv length")
-            .apply_keystream(&mut buf);
-        Ok(buf)
-    }
-    fn name(&self) -> &'static str {
-        "StreamRaw"
-    }
-    fn overhead(&self) -> usize {
-        0
-    }
-    fn guarantees(&self) -> &'static str {
-        "conf only (fixed nonce; full keystream reuse every message)"
-    }
-}
-
-// ============================================================================
-// Variant 6: SivShortNonce  (short random nonce, zero-padded to full width)
-//
-// Stateless (no counter to desync). Ships SHORT_NONCE_LEN random bytes and zero-pads them to the
-// cipher's nonce width. Collisions occur on the birthday bound of the SHORT space (~2^16 messages
-// for 4 bytes), so this is sound ONLY with a misuse-resistant AEAD (AES-GCM-SIV), where a collision
-// costs an equality leak rather than a confidentiality break. Do not instantiate with a plain AEAD.
-// ============================================================================
-
-pub struct SivShortNonce<A> {
-    enc_key: [u8; 32],
-    _p: PhantomData<A>,
-}
-impl<A> SivShortNonce<A> {
-    pub fn new(base_key: &[u8]) -> Self {
-        Self {
-            enc_key: derive_enc_key(base_key),
-            _p: PhantomData,
-        }
-    }
-}
-impl<A: KeyInit + AeadCore + AeadInPlace> Protocol for SivShortNonce<A> {
-    fn seal(&self, msg: &[u8]) -> Vec<u8> {
-        let mut short = [0u8; SHORT_NONCE_LEN];
-        OsRng.fill_bytes(&mut short);
-        let nonce = expand_short_nonce(aead_nonce_len::<A>(), &short);
-        let (ct, tag) = aead_seal_with_nonce::<A>(&self.enc_key, &nonce, msg);
-        [short.to_vec(), ct, tag].concat() // ship only the SHORT bytes
-    }
-    fn open(&self, wire: &[u8]) -> Result<Vec<u8>, ProtoError> {
-        let tag_len = aead_tag_len::<A>();
-        if wire.len() < SHORT_NONCE_LEN + tag_len {
-            return Err(ProtoError::TooShort);
-        }
-        let short = &wire[..SHORT_NONCE_LEN];
-        let body = &wire[SHORT_NONCE_LEN..];
-        let ct = &body[..body.len() - tag_len];
-        let tag = &body[body.len() - tag_len..];
-        let nonce = expand_short_nonce(aead_nonce_len::<A>(), short);
-        aead_open::<A>(&self.enc_key, &nonce, ct, tag)
-    }
-    fn name(&self) -> &'static str {
-        "SivShortN"
-    }
-    fn overhead(&self) -> usize {
-        SHORT_NONCE_LEN + aead_tag_len::<A>()
-    }
-    fn guarantees(&self) -> &'static str {
-        "conf + integrity + sym-auth; 4B random nonce (collision = equality leak)"
-    }
 }
 
 // ============================================================================
@@ -633,15 +238,13 @@ impl<A: KeyInit + AeadCore + AeadInPlace> Protocol for SivShortNonce<A> {
 pub struct StreamSiv<S, const N: usize> {
     enc_key: [u8; 32],
     mac_key: [u8; 32],
-    label: &'static str,
     _p: PhantomData<S>,
 }
 impl<S, const N: usize> StreamSiv<S, N> {
-    pub fn new(base_key: &[u8], label: &'static str) -> Self {
+    pub fn new(base_key: &[u8]) -> Self {
         Self {
             enc_key: derive_enc_key(base_key),
             mac_key: derive_mac_key(base_key),
-            label,
             _p: PhantomData,
         }
     }
@@ -675,9 +278,6 @@ impl<S: KeyIvInit + StreamCipher, const N: usize> Protocol for StreamSiv<S, N> {
             return Err(ProtoError::Mac);
         }
         Ok(buf)
-    }
-    fn name(&self) -> &'static str {
-        self.label
     }
     fn overhead(&self) -> usize {
         N
