@@ -93,7 +93,9 @@ impl PacketSource for Source {
                 NonZeroU32::new(eth_p_all as u32).unwrap(),
             )),
         )?;
-        // Intentionally don't bind so we can listen on all interfaces.
+
+        // NOTE: Intentionally don't bind so we can listen on all interfaces.
+
         Ok(Self {
             fd,
             buf: vec![0u8; 2048],
@@ -106,6 +108,7 @@ impl PacketSource for Source {
             len: prog.len() as u16,
             filter: prog.as_ptr() as *mut _,
         };
+
         let rc = unsafe {
             libc::setsockopt(
                 self.fd.as_raw_fd(),
@@ -115,9 +118,11 @@ impl PacketSource for Source {
                 std::mem::size_of::<libc::sock_fprog>() as u32,
             )
         };
+
         if rc < 0 {
             return Err(io::Error::last_os_error().into());
         }
+
         Ok(())
     }
 

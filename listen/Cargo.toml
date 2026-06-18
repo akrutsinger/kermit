@@ -1,0 +1,22 @@
+[package]
+name = "listen"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["linux"]
+linux = []
+macos = []
+freebsd = []
+openbsd = []
+windows = []
+
+[dependencies]
+# Workspace dependencies
+crypto = { path = "../crypto" }
+
+anyhow = { version = "1.0.102", default-features = false }
+chacha20 = { version = "0.10", default-features = false, features = ["cipher"] }
+libc = { version = "0.2.186", default-features = false }
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+rustix = { version = "1.1.4", default-features = false, features = ["net", "std"] }

@@ -56,6 +56,13 @@ pub const NONCE_WINDOW: usize = 4;
 /// is also stored in a file to detect replays.
 pub const APP_NONCE_LEN: usize = 8;
 
+macro_rules! dbgprintln {
+    ($($arg:tt)*) => {{
+        #[cfg(debug_assertions)]
+        println!($($arg)*);
+    }};
+}
+
 // ============================================================================
 // Errors + the unifying trait
 // ============================================================================
@@ -65,20 +72,20 @@ pub enum ProtoError {
     TooShort,
     Mac,
     NoncePresent,
-    Io,
+    Io(std::io::ErrorKind),
     Init,
 }
 
 impl std::fmt::Display for ProtoError {
     fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         #[cfg(debug_assertions)]
-        _f.write_str(match self {
-            ProtoError::TooShort => "input too short",
-            ProtoError::Mac => "mac verification failed",
-            ProtoError::NoncePresent => "nonce already present (replay detected)",
-            ProtoError::Io => "nonce-file i/o failed",
-            ProtoError::Init => "crypto primitive init failed",
-        })?;
+        match self {
+            ProtoError::TooShort => _f.write_str("input too short")?,
+            ProtoError::Mac => _f.write_str("mac verification failed")?,
+            ProtoError::NoncePresent => _f.write_str("nonce already present (replay detected)")?,
+            ProtoError::Io(kind) => write!(_f, "i/o error: {kind:?}")?,
+            ProtoError::Init => _f.write_str("crypto primitive init failed")?,
+        }
         Ok(())
     }
 }
@@ -88,9 +95,6 @@ impl std::error::Error for ProtoError {}
 pub trait Protocol {
     fn seal(&self, msg: &[u8]) -> Result<Vec<u8>, ProtoError>;
     fn open(&self, wire: &[u8]) -> Result<Vec<u8>, ProtoError>;
-    /// Fixed per-message wire expansion in bytes (computed from the primitives,
-    /// not measured). Constant because every cipher here is stream/CTR-based.
-    fn overhead(&self) -> usize;
 }
 
 // ============================================================================
@@ -191,10 +195,13 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
         .create(true)
         .truncate(false)
         .open("/tmp/nonce")
-        .map_err(|_| ProtoError::Io)?;
+        .map_err(|e| {
+            dbgprintln!("nonce open: {e}");
+            ProtoError::Io(e.kind())
+        })?;
 
     let mut ring = vec![0u8; file_len];
-    if file.read(&mut ring).map_err(|_| ProtoError::Io)? == file_len {
+    if file.read(&mut ring).map_err(|e| ProtoError::Io(e.kind()))? == file_len {
         ring = stream_open::<ChaCha20>(&file_key, &iv, &ring)?;
     }
 
@@ -209,9 +216,10 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
     ring[1 + head * n..1 + (head + 1) * n].copy_from_slice(nonce);
     ring[0] = ((head + 1) % NONCE_WINDOW) as u8;
 
-    file.seek(SeekFrom::Start(0)).map_err(|_| ProtoError::Io)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| ProtoError::Io(e.kind()))?;
     file.write_all(&stream_open::<ChaCha20>(&file_key, &iv, &ring)?)
-        .map_err(|_| ProtoError::Io)?;
+        .map_err(|e| ProtoError::Io(e.kind()))?;
     Ok(())
 }
 
@@ -283,9 +291,5 @@ impl<S: KeyIvInit + StreamCipher, const N: usize> Protocol for StreamSiv<S, N> {
             .apply_keystream(&mut buf);
         mac_verify(&self.mac_key, &buf, tag)?;
         Ok(buf)
-    }
-
-    fn overhead(&self) -> usize {
-        N
     }
 }

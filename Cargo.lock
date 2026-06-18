@@ -73,6 +73,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chacha20",
+ "cipher",
+ "hkdf",
+ "hmac",
+ "rand_core",
+ "sha2",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -141,6 +154,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "holla"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chacha20",
+ "crypto",
+]
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -175,15 +197,11 @@ name = "listen"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64",
  "chacha20",
- "cipher",
- "hkdf",
- "hmac",
+ "crypto",
  "libc",
  "rand_core",
  "rustix",
- "sha2",
 ]
 
 [[package]]
