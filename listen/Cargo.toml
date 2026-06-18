@@ -17,7 +17,6 @@ common.workspace = true
 crypto.workspace = true
 
 # External
-anyhow.workspace = true
 chacha20.workspace = true
 libc.workspace = true
 getrandom.workspace = true

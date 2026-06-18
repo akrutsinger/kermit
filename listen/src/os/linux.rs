@@ -5,7 +5,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use rustix::net::{AddressFamily, Protocol, RecvFlags, SocketFlags, SocketType, socket_with};
 
 use crate::filter::SockFilter;
-use crate::source::PacketSource;
+use crate::source::{ListenError, PacketSource};
 
 // tcpdump -dd "inbound and udp and src host 1.2.3.4"
 //
@@ -83,16 +83,16 @@ pub struct Source {
 impl PacketSource for Source {
     type Filter = [SockFilter];
 
-    fn open(_iface: Option<&str>) -> anyhow::Result<Self> {
-        let eth_p_all: u16 = (libc::ETH_P_ALL as u16).to_be();
+    fn open(_iface: Option<&str>) -> Result<Self, ListenError> {
+        let eth_p_all_be = NonZeroU32::new((libc::ETH_P_ALL as u16).to_be() as u32)
+            .ok_or(ListenError::Io(std::io::ErrorKind::InvalidInput))?;
         let fd = socket_with(
             AddressFamily::PACKET,
             SocketType::RAW,
             SocketFlags::CLOEXEC,
-            Some(Protocol::from_raw(
-                NonZeroU32::new(eth_p_all as u32).unwrap(),
-            )),
-        )?;
+            Some(Protocol::from_raw(eth_p_all_be)),
+        )
+        .map_err(|e| ListenError::Io(std::io::Error::from(e).kind()))?;
 
         // NOTE: Intentionally don't bind so we can listen on all interfaces.
 
@@ -103,7 +103,7 @@ impl PacketSource for Source {
         })
     }
 
-    fn attach_filter(&mut self, prog: &[SockFilter]) -> anyhow::Result<()> {
+    fn attach_filter(&mut self, prog: &[SockFilter]) -> Result<(), ListenError> {
         let fprog = libc::sock_fprog {
             len: prog.len() as u16,
             filter: prog.as_ptr() as *mut _,
@@ -120,14 +120,15 @@ impl PacketSource for Source {
         };
 
         if rc < 0 {
-            return Err(io::Error::last_os_error().into());
+            return Err(ListenError::Io(io::Error::last_os_error().kind()));
         }
 
         Ok(())
     }
 
-    fn recv(&mut self) -> anyhow::Result<&[u8]> {
-        let (n, _flags) = rustix::net::recv(&self.fd, &mut self.buf, RecvFlags::empty())?;
+    fn recv(&mut self) -> Result<&[u8], ListenError> {
+        let (n, _flags) = rustix::net::recv(&self.fd, &mut self.buf, RecvFlags::empty())
+            .map_err(|e| ListenError::Io(std::io::Error::from(e).kind()))?;
         self.last_len = n;
         Ok(&self.buf[..n])
     }

@@ -5,7 +5,7 @@ use rustix::fs::{Mode, OFlags, open};
 use rustix::io::read;
 
 use crate::filter::SockFilter;
-use crate::source::PacketSource;
+use crate::source::{ListenError, PacketSource};
 
 // tcpdump -dd "udp and src host 1.2.3.4"  (direction handled by ioctl)
 pub static FILTER: [SockFilter; 8] = [
@@ -82,9 +82,8 @@ pub struct Source {
 impl PacketSource for Source {
     type Filter = [SockFilter];
 
-    fn open(iface: Option<&str>) -> anyhow::Result<Self> {
-        let iface =
-            iface.ok_or_else(|| anyhow::anyhow!("BPF requires an interface name (e.g. en0)"))?;
+    fn open(iface: Option<&str>) -> Result<Self, ListenError> {
+        let iface = iface.ok_or(ListenError::NoIface)?;
 
         let mut fd = None;
         for i in 0..256 {
@@ -96,16 +95,16 @@ impl PacketSource for Source {
                 }
                 Err(rustix::io::Errno::BUSY) => continue,
                 Err(rustix::io::Errno::ACCESS) | Err(rustix::io::Errno::PERM) => continue,
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(ListenError::Io(std::io::Error::from(e).kind())),
             }
         }
-        let fd = fd.ok_or_else(|| anyhow::anyhow!("no available /dev/bpf* device"))?;
+        let fd = fd.ok_or(ListenError::NoBpfDevice)?;
         let raw = fd.as_raw_fd();
 
         let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
         let name = iface.as_bytes();
         if name.len() >= ifr.ifr_name.len() {
-            anyhow::bail!("interface name too long: {}", iface);
+            return Err(ListenError::IfaceNameTooLong);
         }
         for (i, &b) in name.iter().enumerate() {
             ifr.ifr_name[i] = b as libc::c_char;
@@ -139,7 +138,7 @@ impl PacketSource for Source {
         })
     }
 
-    fn attach_filter(&mut self, prog: &[SockFilter]) -> anyhow::Result<()> {
+    fn attach_filter(&mut self, prog: &[SockFilter]) -> Result<(), ListenError> {
         // libc::bpf_program { bf_len: u_int, bf_insns: *mut bpf_insn }
         // `bpf_insn` has the same layout as our `SockFilter`.
         let fprog = libc::bpf_program {
@@ -153,7 +152,7 @@ impl PacketSource for Source {
         )
     }
 
-    fn recv(&mut self) -> anyhow::Result<&[u8]> {
+    fn recv(&mut self) -> Result<&[u8], ListenError> {
         loop {
             if self.pos < self.valid {
                 let hdr_ptr = unsafe { self.buf.as_ptr().add(self.pos) } as *const libc::bpf_hdr;
@@ -164,16 +163,17 @@ impl PacketSource for Source {
                 self.pos = word_align(pkt_end);
                 return Ok(&self.buf[pkt_start..pkt_end]);
             }
-            self.valid = read(&self.fd, &mut self.buf)?;
+            self.valid = read(&self.fd, &mut self.buf)
+                .map_err(|e| ListenError::Io(std::io::Error::from(e).kind()))?;
             self.pos = 0;
         }
     }
 }
 
-fn ioctl_or_err(fd: i32, req: libc::c_ulong, arg: *mut libc::c_void) -> anyhow::Result<()> {
+fn ioctl_or_err(fd: i32, req: libc::c_ulong, arg: *mut libc::c_void) -> Result<(), ListenError> {
     let rc = unsafe { libc::ioctl(fd, req, arg) };
     if rc < 0 {
-        Err(io::Error::last_os_error().into())
+        Err(ListenError::Io(io::Error::last_os_error().kind()))
     } else {
         Ok(())
     }

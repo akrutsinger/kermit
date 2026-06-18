@@ -20,7 +20,7 @@ use rustix::net::{
     AddressFamily, RecvFlags, SocketAddrAny, SocketFlags, SocketType, bind, socket_with,
 };
 
-use crate::source::PacketSource;
+use crate::source::{ListenError, PacketSource};
 
 #[derive(Clone, Copy)]
 pub struct Filter {
@@ -59,13 +59,9 @@ pub struct Source {
 impl PacketSource for Source {
     type Filter = Filter;
 
-    fn open(iface: Option<&str>) -> anyhow::Result<Self> {
-        let addr_str = iface.ok_or_else(|| {
-            anyhow::anyhow!("Windows SIO_RCVALL requires a local IPv4 address (e.g. 192.168.1.5)")
-        })?;
-        let ip: Ipv4Addr = addr_str
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid IPv4 address {}: {}", addr_str, e))?;
+    fn open(iface: Option<&str>) -> Result<Self, ListenError> {
+        let addr_str = iface.ok_or(ListenError::NoIface)?;
+        let ip: Ipv4Addr = addr_str.parse().map_err(|_| ListenError::InvalidAddr)?;
 
         // socket(AF_INET, SOCK_RAW, 0)  — protocol=None → 0 = IPPROTO_IP
         let fd = socket_with(
@@ -73,10 +69,11 @@ impl PacketSource for Source {
             SocketType::RAW,
             SocketFlags::empty(),
             None,
-        )?;
+        )
+        .map_err(|e| ListenError::Io(std::io::Error::from(e).kind()))?;
 
         let sa = SocketAddrAny::from(std::net::SocketAddr::V4(SocketAddrV4::new(ip, 0)));
-        bind(&fd, &sa)?;
+        bind(&fd, &sa).map_err(|e| ListenError::Io(std::io::Error::from(e).kind()))?;
 
         let mut bytes_returned: u32 = 0;
         let on: u32 = RCVALL_ON;
@@ -94,7 +91,7 @@ impl PacketSource for Source {
             )
         };
         if rc != 0 {
-            return Err(io::Error::last_os_error().into());
+            return Err(ListenError::Io(io::Error::last_os_error().kind()));
         }
 
         Ok(Self {
@@ -104,14 +101,15 @@ impl PacketSource for Source {
         })
     }
 
-    fn attach_filter(&mut self, prog: &Filter) -> anyhow::Result<()> {
+    fn attach_filter(&mut self, prog: &Filter) -> Result<(), ListenError> {
         self.filter = *prog;
         Ok(())
     }
 
-    fn recv(&mut self) -> anyhow::Result<&[u8]> {
+    fn recv(&mut self) -> Result<&[u8], ListenError> {
         loop {
-            let (n, _flags) = rustix::net::recv(&self.fd, &mut self.buf, RecvFlags::empty())?;
+            let (n, _flags) = rustix::net::recv(&self.fd, &mut self.buf, RecvFlags::empty())
+                .map_err(|e| ListenError::Io(std::io::Error::from(e).kind()))?;
             // NLL doesn't let us return inside the loop while still borrowing self.buf
             // conditionally; check first, then re-borrow on return.
             if accept(&self.buf[..n], &self.filter) {
