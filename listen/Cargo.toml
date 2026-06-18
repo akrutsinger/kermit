@@ -14,6 +14,7 @@ windows = []
 [dependencies]
 # Workspace dependencies
 crypto = { path = "../crypto" }
+common = { path = "../common" }
 
 anyhow = { version = "1.0.102", default-features = false }
 chacha20 = { version = "0.10", default-features = false, features = ["cipher"] }

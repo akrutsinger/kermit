@@ -1,12 +1,6 @@
 use anyhow::Result;
+use common::dbgprintln;
 use crypto::*;
-
-macro_rules! dbgprintln {
-    ($($arg:tt)*) => {{
-        #[cfg(debug_assertions)]
-        println!($($arg)*);
-    }};
-}
 
 fn main() -> Result<()> {
     // let mut base_key = [0u8; 32];

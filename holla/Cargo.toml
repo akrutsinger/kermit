@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 # Workspace dependencies
+common = { path = "../common" }
 crypto = { path = "../crypto" }
 
 anyhow = { version = "1.0.102", default-features = false }

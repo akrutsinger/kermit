@@ -5,15 +5,9 @@ mod source;
 use rand_core::{OsRng, RngCore};
 
 //use rustix::path::Arg;
+use common::dbgprintln;
 use crypto::*;
 use source::PacketSource;
-
-macro_rules! dbgprintln {
-    ($($arg:tt)*) => {{
-        #[cfg(debug_assertions)]
-        println!($($arg)*);
-    }};
-}
 
 fn packet_handler(pkt: Vec<u8>) {
     dbgprintln!("matched: {} bytes", pkt.len());
