@@ -43,7 +43,6 @@ use std::marker::PhantomData;
 
 use common::dbgprintln;
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20::ChaCha20;
 use cipher::{IvSizeUser, KeyIvInit, StreamCipher};
 use getrandom::fill;
@@ -166,10 +165,6 @@ pub fn prepend_nonce(msg: &[u8]) -> Result<Vec<u8>, ProtoError> {
     buf.extend_from_slice(&nonce);
     buf.extend_from_slice(msg);
     Ok(buf)
-}
-
-pub fn to_base64(data: &[u8]) -> String {
-    URL_SAFE_NO_PAD.encode(data)
 }
 
 /// Check the `/tmp/nonce` ring buffer for `nonce`; return `Err(NoncePresent)` if found, otherwise

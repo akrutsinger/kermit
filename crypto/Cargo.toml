@@ -8,7 +8,6 @@ edition.workspace = true
 common.workspace = true
 
 # External
-base64.workspace = true
 chacha20.workspace = true
 cipher.workspace = true
 hkdf.workspace = true
