@@ -41,13 +41,14 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 
-// use aead::KeyInit;
+use common::dbgprintln;
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20::ChaCha20;
 use cipher::{IvSizeUser, KeyIvInit, StreamCipher};
+use getrandom::fill;
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
-use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 
 /// Number of recent nonces retained for replay detection.
@@ -55,13 +56,6 @@ pub const NONCE_WINDOW: usize = 4;
 /// Length of the application-layer replay nonce that the driver prepends before sealing. This nonce
 /// is also stored in a file to detect replays.
 pub const APP_NONCE_LEN: usize = 8;
-
-macro_rules! dbgprintln {
-    ($($arg:tt)*) => {{
-        #[cfg(debug_assertions)]
-        println!($($arg)*);
-    }};
-}
 
 // ============================================================================
 // Errors + the unifying trait
@@ -165,13 +159,13 @@ fn stream_open<S: KeyIvInit + StreamCipher>(
 /// driver before any crypto -- the `Protocol` impls treat the result as an opaque message and never
 /// add a nonce of their own. (In the SIV variants this nonce is load-bearing: it is what makes the
 /// synthetic IV differ between otherwise-identical messages. Elsewhere it is inert payload.)
-pub fn prepend_nonce(msg: &[u8]) -> Vec<u8> {
+pub fn prepend_nonce(msg: &[u8]) -> Result<Vec<u8>, ProtoError> {
     let mut buf = Vec::with_capacity(APP_NONCE_LEN + msg.len());
     let mut nonce = [0u8; APP_NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce);
+    fill(&mut nonce).map_err(|_| ProtoError::Init)?;
     buf.extend_from_slice(&nonce);
     buf.extend_from_slice(msg);
-    buf
+    Ok(buf)
 }
 
 pub fn to_base64(data: &[u8]) -> String {

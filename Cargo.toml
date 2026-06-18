@@ -2,6 +2,27 @@
 members = ["crypto", "listen", "holla", "common"]
 resolver = "2"
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+# Internal
+common = { path = "common" }
+crypto = { path = "crypto" }
+
+# External
+anyhow = { version = "1.0.102", default-features = false }
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+chacha20 = { version = "0.10", default-features = false, features = ["cipher"] }
+cipher = { version = "0.5", default-features = false }
+hkdf = { version = "0.13", default-features = false }
+hmac = { version = "0.13", default-features = false }
+libc = { version = "0.2.186", default-features = false }
+getrandom = { version = "0.4", default-features = false }
+rustix = { version = "1.1.4", default-features = false, features = ["net", "std"] }
+sha2 = { version = "0.11", default-features = false }
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

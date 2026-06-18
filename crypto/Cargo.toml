@@ -1,13 +1,17 @@
 [package]
 name = "crypto"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
 
 [dependencies]
-base64 = { version = "0.22", default-features = false, features = ["std"] }
-chacha20 = { version = "0.10", default-features = false, features = ["cipher"] }
-cipher = { version = "0.5", default-features = false }
-hkdf = { version = "0.13", default-features = false }
-hmac = { version = "0.13", default-features = false }
-rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
-sha2 = { version = "0.11", default-features = false }
+# Internal
+common.workspace = true
+
+# External
+base64.workspace = true
+chacha20.workspace = true
+cipher.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+getrandom.workspace = true
+sha2.workspace = true

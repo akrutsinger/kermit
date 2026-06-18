@@ -1,12 +1,13 @@
 [package]
 name = "holla"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
 
 [dependencies]
-# Workspace dependencies
-common = { path = "../common" }
-crypto = { path = "../crypto" }
+# Internal
+common.workspace = true
+crypto.workspace = true
 
-anyhow = { version = "1.0.102", default-features = false }
-chacha20 = { version = "0.10", default-features = false, features = ["cipher"] }
+# External
+anyhow.workspace = true
+chacha20.workspace = true

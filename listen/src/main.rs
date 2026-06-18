@@ -2,11 +2,9 @@ mod filter;
 mod os;
 mod source;
 
-use rand_core::{OsRng, RngCore};
-
-//use rustix::path::Arg;
 use common::dbgprintln;
 use crypto::*;
+use getrandom::fill;
 use source::PacketSource;
 
 fn packet_handler(pkt: Vec<u8>) {
@@ -16,7 +14,10 @@ fn packet_handler(pkt: Vec<u8>) {
 fn main() {
     let base_key = *b"listen-test-key-0000000000000000";
     let mut nonce = [0u8; APP_NONCE_LEN];
-    OsRng.fill_bytes(&mut nonce);
+    if let Err(e) = fill(&mut nonce) {
+        dbgprintln!("failed to generate nonce: {e}");
+        return;
+    }
     match check_and_record_nonce(&nonce, &base_key) {
         Ok(()) => (),
         Err(e) => {
