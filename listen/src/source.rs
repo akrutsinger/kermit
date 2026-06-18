@@ -1,18 +1,18 @@
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum ListenError {
-    Io(std::io::ErrorKind),
+    Io(rustix::io::Errno),
     NoIface,
     NoBpfDevice,
     IfaceNameTooLong,
     InvalidAddr,
 }
 
-impl std::fmt::Display for ListenError {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ListenError {
+    fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         #[cfg(debug_assertions)]
         match self {
-            ListenError::Io(kind) => write!(_f, "i/o error: {kind:?}")?,
+            ListenError::Io(errno) => write!(_f, "i/o error: {errno:?}")?,
             ListenError::NoIface => _f.write_str("interface name required")?,
             ListenError::NoBpfDevice => _f.write_str("no available /dev/bpf* device")?,
             ListenError::IfaceNameTooLong => _f.write_str("interface name too long")?,
@@ -22,7 +22,7 @@ impl std::fmt::Display for ListenError {
     }
 }
 
-impl std::error::Error for ListenError {}
+impl core::error::Error for ListenError {}
 
 // Linux & BSDs share the cBPF instruction format (`[SockFilter]`). Windows
 // has no kernel cBPF for raw IPv4 sockets, so it filters in userspace and
