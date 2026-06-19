@@ -3,7 +3,7 @@
 //! each message carries all the receiver needs to open it, with no shared counter to keep in sync.
 //!
 //! The crypto layer operates on whatever bytes it is handed; the driver appends an 8-byte
-//! application replay nonce ONCE (see [`prepend_nonce`](crate::crypto::prepend_nonce)) before
+//! application replay nonce ONCE (see [`prepend_nonce`](crate::prepend_nonce)) before
 //! sealing, so the message every variant protects is `app_nonce(8) || message` and the reported
 //! overhead is pure crypto expansion, never payload. The variants differ only in the envelope:
 //!
@@ -38,16 +38,22 @@
 //!   only an equality leak, not a keystream break, which is why SivShortNonce survives on a 4-byte
 //!   nonce where a raw stream cipher cannot.
 
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::marker::PhantomData;
+#![no_std]
+
+extern crate alloc;
+
+use alloc::vec;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
 
 use common::dbgprintln;
 
 use chacha20::ChaCha20;
-use cipher::{IvSizeUser, KeyIvInit, StreamCipher};
+use cipher::{KeyIvInit, StreamCipher};
 use getrandom::fill;
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
+use rustix::fs::{Mode, OFlags, SeekFrom};
 use sha2::Sha256;
 
 /// Number of recent nonces retained for replay detection.
@@ -55,6 +61,12 @@ pub const NONCE_WINDOW: usize = 4;
 /// Length of the application-layer replay nonce that the driver prepends before sealing. This nonce
 /// is also stored in a file to detect replays.
 pub const APP_NONCE_LEN: usize = 8;
+
+/// On-disk layout size: `[head: u8][slot_0..slot_N-1]` where each slot is `APP_NONCE_LEN` bytes.
+const NONCE_FILE_LEN: usize = 1 + NONCE_WINDOW * APP_NONCE_LEN;
+
+/// ChaCha20 (IETF variant) uses a 96-bit nonce.
+const CHACHA20_NONCE_LEN: usize = 12;
 
 // ============================================================================
 // Errors + the unifying trait
@@ -65,25 +77,25 @@ pub enum ProtoError {
     TooShort,
     Mac,
     NoncePresent,
-    Io(std::io::ErrorKind),
+    Io(rustix::io::Errno),
     Init,
 }
 
-impl std::fmt::Display for ProtoError {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ProtoError {
+    fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         #[cfg(debug_assertions)]
         match self {
             ProtoError::TooShort => _f.write_str("input too short")?,
             ProtoError::Mac => _f.write_str("mac verification failed")?,
             ProtoError::NoncePresent => _f.write_str("nonce already present (replay detected)")?,
-            ProtoError::Io(kind) => write!(_f, "i/o error: {kind:?}")?,
+            ProtoError::Io(errno) => write!(_f, "i/o error: {errno:?}")?,
             ProtoError::Init => _f.write_str("crypto primitive init failed")?,
         }
         Ok(())
     }
 }
 
-impl std::error::Error for ProtoError {}
+impl core::error::Error for ProtoError {}
 
 pub trait Protocol {
     fn seal(&self, msg: &[u8]) -> Result<Vec<u8>, ProtoError>;
@@ -143,15 +155,17 @@ fn siv_iv<S: KeyIvInit>(tag: &[u8], n: usize) -> Vec<u8> {
     expand_short_nonce(iv_len, &tag[..n.min(iv_len)])
 }
 
-fn stream_open<S: KeyIvInit + StreamCipher>(
+/// XOR `buf` in place with the keystream from cipher `S`. Used where a heap allocation for a new
+/// buffer would be wasteful (e.g. the nonce ring buffer in `check_and_record_nonce`).
+fn stream_xor_in_place<S: KeyIvInit + StreamCipher>(
     key: &[u8],
     iv: &[u8],
-    ct: &[u8],
-) -> Result<Vec<u8>, ProtoError> {
-    let mut buf = ct.to_vec();
-    let mut c = S::new_from_slices(key, iv).map_err(|_| ProtoError::Init)?;
-    c.apply_keystream(&mut buf);
-    Ok(buf)
+    buf: &mut [u8],
+) -> Result<(), ProtoError> {
+    S::new_from_slices(key, iv)
+        .map_err(|_| ProtoError::Init)?
+        .apply_keystream(buf);
+    Ok(())
 }
 
 /// Application-layer framing: append an 8-byte replay nonce to the message. Called ONCE by the
@@ -173,25 +187,24 @@ pub fn prepend_nonce(msg: &[u8]) -> Result<Vec<u8>, ProtoError> {
 /// On-disk layout: 33 bytes of ChaCha20-encrypted ring buffer. Fixed zero IV is safe because the
 /// derived key is unique per session. Plaintext layout: `[head: u8][slot_0..slot_N-1]`.
 pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), ProtoError> {
+    debug_assert_eq!(nonce.len(), APP_NONCE_LEN);
     let n = nonce.len();
-    let file_len = 1 + NONCE_WINDOW * n;
     let file_key = derive_key(base_key, b"nonce-file:key:v1")?;
-    let iv = vec![0u8; ChaCha20::iv_size()];
+    let iv = [0u8; CHACHA20_NONCE_LEN];
 
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open("/tmp/nonce")
-        .map_err(|e| {
-            dbgprintln!("nonce open: {e}");
-            ProtoError::Io(e.kind())
-        })?;
+    let fd = rustix::fs::open(
+        c"/tmp/nonce",
+        OFlags::RDWR | OFlags::CREATE,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|e| {
+        dbgprintln!("nonce open: {e:?}");
+        ProtoError::Io(e)
+    })?;
 
-    let mut ring = vec![0u8; file_len];
-    if file.read(&mut ring).map_err(|e| ProtoError::Io(e.kind()))? == file_len {
-        ring = stream_open::<ChaCha20>(&file_key, &iv, &ring)?;
+    let mut ring = [0u8; NONCE_FILE_LEN];
+    if rustix::io::read(&fd, &mut ring).map_err(ProtoError::Io)? == NONCE_FILE_LEN {
+        stream_xor_in_place::<ChaCha20>(&file_key, &iv, &mut ring)?;
     }
 
     let head = (ring[0] as usize) % NONCE_WINDOW;
@@ -205,10 +218,10 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
     ring[1 + head * n..1 + (head + 1) * n].copy_from_slice(nonce);
     ring[0] = ((head + 1) % NONCE_WINDOW) as u8;
 
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| ProtoError::Io(e.kind()))?;
-    file.write_all(&stream_open::<ChaCha20>(&file_key, &iv, &ring)?)
-        .map_err(|e| ProtoError::Io(e.kind()))?;
+    stream_xor_in_place::<ChaCha20>(&file_key, &iv, &mut ring)?;
+
+    rustix::fs::seek(&fd, SeekFrom::Start(0)).map_err(ProtoError::Io)?;
+    rustix::io::write(&fd, &ring).map_err(ProtoError::Io)?;
     Ok(())
 }
 

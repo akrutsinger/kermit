@@ -83,6 +83,7 @@ dependencies = [
  "getrandom",
  "hkdf",
  "hmac",
+ "rustix",
  "sha2",
 ]
 

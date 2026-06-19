@@ -14,3 +14,4 @@ hkdf.workspace = true
 hmac.workspace = true
 getrandom.workspace = true
 sha2.workspace = true
+rustix = { workspace = true, features = ["fs"] }
