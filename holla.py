@@ -49,7 +49,7 @@ def prepend_nonce(msg: bytes, n: int = 8) -> bytes:
 
 
 if __name__ == "__main__":
-    # main()
+    main()
 
     p = cipher.SivCipher(n=4)
     framed = prepend_nonce(b"123456")  # msg || 8-byte app nonce

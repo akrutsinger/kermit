@@ -1,3 +1,7 @@
+// TODO: rewrite for no_std — currently uses std::io, Vec, std::net, and std::ffi.
+// try_recv() needs non-blocking mode (FIONBIO/ioctlsocket) + WSAEWOULDBLOCK mapped to Ok(None).
+// ListenError::Io wraps rustix::io::Errno, not std::io::ErrorKind — all error conversions need fixing.
+
 // Windows packet listener via SIO_RCVALL on a raw IPv4 socket.
 //
 // Caveats:
@@ -104,6 +108,10 @@ impl PacketSource for Source {
     fn attach_filter(&mut self, prog: &Filter) -> Result<(), ListenError> {
         self.filter = *prog;
         Ok(())
+    }
+
+    fn try_recv(&mut self) -> Result<Option<&[u8]>, ListenError> {
+        todo!("Windows non-blocking recv: ioctlsocket FIONBIO, map WSAEWOULDBLOCK to Ok(None)")
     }
 
     fn recv(&mut self) -> Result<&[u8], ListenError> {

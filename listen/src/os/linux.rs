@@ -79,7 +79,6 @@ pub static FILTER: [SockFilter; 10] = [
 pub struct Source {
     fd: OwnedFd,
     buf: [u8; RECV_BUF_SIZE],
-    last_len: usize,
 }
 
 impl PacketSource for Source {
@@ -91,7 +90,7 @@ impl PacketSource for Source {
         let fd = socket_with(
             AddressFamily::PACKET,
             SocketType::RAW,
-            SocketFlags::CLOEXEC,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
             Some(Protocol::from_raw(eth_p_all_be)),
         )
         .map_err(ListenError::Io)?;
@@ -101,7 +100,6 @@ impl PacketSource for Source {
         Ok(Self {
             fd,
             buf: [0u8; RECV_BUF_SIZE],
-            last_len: 0,
         })
     }
 
@@ -130,10 +128,17 @@ impl PacketSource for Source {
         Ok(())
     }
 
-    fn recv(&mut self) -> Result<&[u8], ListenError> {
-        let (n, _flags) = rustix::net::recv(&self.fd, &mut self.buf[..], RecvFlags::empty())
-            .map_err(ListenError::Io)?;
-        self.last_len = n;
-        Ok(&self.buf[..n])
+    fn try_recv(&mut self) -> Result<Option<&[u8]>, ListenError> {
+        match rustix::net::recv(&self.fd, &mut self.buf[..], RecvFlags::empty()) {
+            Ok((n, _)) => Ok(Some(&self.buf[..n])),
+            Err(Errno::AGAIN) => Ok(None),
+            Err(e) => Err(ListenError::Io(e)),
+        }
+    }
+}
+
+impl rustix::fd::AsRawFd for Source {
+    fn as_raw_fd(&self) -> rustix::fd::RawFd {
+        self.fd.as_raw_fd()
     }
 }

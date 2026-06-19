@@ -1,3 +1,6 @@
+// TODO: rewrite for no_std — currently uses std::io, Vec, and format!().
+// try_recv() needs O_NONBLOCK on the BPF fd + EAGAIN handling (similar to linux).
+
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 
@@ -150,6 +153,10 @@ impl PacketSource for Source {
             libc::BIOCSETF,
             &fprog as *const _ as *mut _,
         )
+    }
+
+    fn try_recv(&mut self) -> Result<Option<&[u8]>, ListenError> {
+        todo!("BPF non-blocking recv: open with O_NONBLOCK, map EAGAIN to Ok(None)")
     }
 
     fn recv(&mut self) -> Result<&[u8], ListenError> {

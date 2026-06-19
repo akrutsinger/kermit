@@ -18,6 +18,9 @@ crypto.workspace = true
 
 # External
 chacha20.workspace = true
+critical-section.workspace = true
+embassy-executor = { workspace = true, features = ["executor-thread"] }
 libc.workspace = true
 getrandom.workspace = true
 rustix.workspace = true
+static_cell.workspace = true
