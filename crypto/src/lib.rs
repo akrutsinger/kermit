@@ -38,7 +38,7 @@
 //!   only an equality leak, not a keystream break, which is why SivShortNonce survives on a 4-byte
 //!   nonce where a raw stream cipher cannot.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
@@ -260,6 +260,13 @@ pub struct StreamSiv<S, const N: usize> {
 
 impl<S, const N: usize> StreamSiv<S, N> {
     pub fn new(base_key: &[u8]) -> Result<Self, ProtoError> {
+        // N is the truncated-HMAC tag width; HMAC-SHA256 yields 32 bytes, so a
+        // larger N would slice past the digest and panic in `mac_tag`.
+
+        // NOTE: We have to wrap this assert in `const` to make it a compile-time error instead of a
+        // runtime panic, because the generic parameter is not a runtime value.
+        const { assert!(N >= 1 && N <= 32, "StreamSiv N must be in 1..=32") };
+
         Ok(Self {
             enc_key: derive_enc_key(base_key)?,
             mac_key: derive_mac_key(base_key)?,
@@ -293,5 +300,61 @@ impl<S: KeyIvInit + StreamCipher, const N: usize> Protocol for StreamSiv<S, N> {
             .apply_keystream(&mut buf);
         mac_verify(&self.mac_key, &buf, tag)?;
         Ok(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chacha20::ChaCha20;
+
+    const KEY: &[u8] = b"kermit-crypto-unit-test-base-key";
+    const MSG: &[u8] = b"hello, kermit!";
+    const N: usize = 4;
+
+    fn proto() -> StreamSiv<ChaCha20, N> {
+        StreamSiv::<ChaCha20, N>::new(KEY).unwrap()
+    }
+
+    #[test]
+    fn round_trip() {
+        let p = proto();
+        let wire = p.seal(MSG).unwrap();
+        assert_eq!(wire.len(), N + MSG.len());
+        assert_eq!(p.open(&wire).unwrap(), MSG);
+    }
+
+    #[test]
+    fn tamper_rejected() {
+        let p = proto();
+        let mut wire = p.seal(MSG).unwrap();
+        *wire.last_mut().unwrap() ^= 0x01;
+        assert_eq!(p.open(&wire), Err(ProtoError::Mac));
+    }
+
+    #[test]
+    fn too_short() {
+        let p = proto();
+        assert_eq!(p.open(&[0u8; N - 1]), Err(ProtoError::TooShort));
+    }
+
+    #[test]
+    fn deterministic() {
+        // The synthetic IV is HMAC(msg), so sealing the same message twice is
+        // bit-identical -- the equality leak the module doc calls out.
+        let p = proto();
+        assert_eq!(p.seal(MSG).unwrap(), p.seal(MSG).unwrap());
+    }
+
+    #[test]
+    fn wire_format_snapshot() {
+        // Golden vector pinning the on-wire bytes for the fixed KEY/MSG/N above
+        // (tag(4) || ct(14)). Regenerate intentionally if the envelope changes.
+        let p = proto();
+        let expected: [u8; N + MSG.len()] = [
+            0xf2, 0x8a, 0x06, 0xa6, 0xe0, 0x39, 0xee, 0xe8, 0x48, 0xa3, 0x3d, 0x15, 0xf0, 0x73,
+            0x34, 0xdd, 0x29, 0x7e,
+        ];
+        assert_eq!(p.seal(MSG).unwrap(), expected);
     }
 }
