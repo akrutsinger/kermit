@@ -53,7 +53,7 @@ use cipher::{KeyIvInit, StreamCipher};
 use getrandom::fill;
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
-use rustix::fs::{Mode, OFlags, SeekFrom};
+use rustix::fs::{FlockOperation, Mode, OFlags, SeekFrom, flock};
 use sha2::Sha256;
 
 /// Number of recent nonces retained for replay detection.
@@ -201,6 +201,14 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
         dbgprintln!("nonce open: {e:?}");
         ProtoError::Io(e)
     })?;
+
+    // The replay window is a read-modify-write on a shared file with no
+    // serialization of its own. Under the multi-threaded handler pool (and
+    // across concurrent processes) two callers could otherwise both read the
+    // ring, both miss a nonce, and both record it -- a hole in the replay
+    // window itself. LOCK_EX serializes the whole critical section; the lock
+    // releases when `fd` is dropped at the end of this function.
+    flock(&fd, FlockOperation::LockExclusive).map_err(ProtoError::Io)?;
 
     let mut ring = [0u8; NONCE_FILE_LEN];
     if rustix::io::read(&fd, &mut ring).map_err(ProtoError::Io)? == NONCE_FILE_LEN {

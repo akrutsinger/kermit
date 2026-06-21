@@ -5,11 +5,22 @@ edition.workspace = true
 
 [features]
 default = ["linux"]
-linux = []
+linux = ["runtime-threads"]
 macos = []
 freebsd = []
 openbsd = []
 windows = []
+
+# Concurrency runtime (mutually exclusive; enforced in src/runtime.rs).
+# runtime-threads: OS thread pool (pthreads) for hosted builds.
+# runtime-embassy: embassy async executor for embedded (future; seam only).
+runtime-threads = []
+runtime-embassy = [
+    "dep:embassy-executor",
+    "dep:embassy-sync",
+    "dep:critical-section",
+    "dep:static_cell",
+]
 
 [dependencies]
 # Internal
@@ -18,9 +29,12 @@ crypto.workspace = true
 
 # External
 chacha20.workspace = true
-critical-section.workspace = true
-embassy-executor = { workspace = true, features = ["executor-thread"] }
 libc.workspace = true
 getrandom.workspace = true
 rustix.workspace = true
-static_cell.workspace = true
+
+# runtime-embassy only
+critical-section = { workspace = true, optional = true }
+embassy-executor = { workspace = true, features = ["executor-thread"], optional = true }
+embassy-sync = { workspace = true, optional = true }
+static_cell = { workspace = true, optional = true }

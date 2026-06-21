@@ -37,8 +37,10 @@ pub trait PacketSource: Send + Sized {
 
     fn attach_filter(&mut self, prog: &Self::Filter) -> Result<(), ListenError>;
 
-    // Returns the next matching packet without blocking, or Ok(None) if none
-    // is available. The returned slice borrows from the source's internal
-    // buffer and is valid until the next call to `try_recv`.
-    fn try_recv(&mut self) -> Result<Option<&[u8]>, ListenError>;
+    // Blocks until the next matching packet arrives. The returned slice borrows
+    // from the source's internal buffer and is valid until the next call to
+    // `recv`. The threaded runtime calls this from a dedicated recv thread; an
+    // async runtime would instead use a non-blocking socket + readiness (see
+    // the embassy seam).
+    fn recv(&mut self) -> Result<&[u8], ListenError>;
 }

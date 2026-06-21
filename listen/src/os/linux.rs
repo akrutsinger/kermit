@@ -87,10 +87,12 @@ impl PacketSource for Source {
     fn open(_iface: Option<&str>) -> Result<Self, ListenError> {
         let eth_p_all_be = NonZeroU32::new((libc::ETH_P_ALL as u16).to_be() as u32)
             .ok_or(ListenError::Io(Errno::INVAL))?;
+        // Blocking socket: the threaded runtime dedicates a thread to recv, so
+        // a blocking read is what we want (an async runtime would set NONBLOCK).
         let fd = socket_with(
             AddressFamily::PACKET,
             SocketType::RAW,
-            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            SocketFlags::CLOEXEC,
             Some(Protocol::from_raw(eth_p_all_be)),
         )
         .map_err(ListenError::Io)?;
@@ -128,11 +130,15 @@ impl PacketSource for Source {
         Ok(())
     }
 
-    fn try_recv(&mut self) -> Result<Option<&[u8]>, ListenError> {
-        match rustix::net::recv(&self.fd, &mut self.buf[..], RecvFlags::empty()) {
-            Ok((n, _)) => Ok(Some(&self.buf[..n])),
-            Err(Errno::AGAIN) => Ok(None),
-            Err(e) => Err(ListenError::Io(e)),
+    fn recv(&mut self) -> Result<&[u8], ListenError> {
+        // Blocking socket, so this parks the calling thread until a frame
+        // arrives. EINTR is retried; everything else is a real error.
+        loop {
+            match rustix::net::recv(&self.fd, &mut self.buf[..], RecvFlags::empty()) {
+                Ok((n, _)) => return Ok(&self.buf[..n]),
+                Err(Errno::INTR) => continue,
+                Err(e) => return Err(ListenError::Io(e)),
+            }
         }
     }
 }
