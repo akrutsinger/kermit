@@ -1,42 +1,51 @@
-//! Stateless authenticated-encryption envelope variants behind one `Protocol` trait, for analyzing
-//! the wire-size <-> security tradeoff of different primitive stacks. Every variant is STATELESS:
-//! each message carries all the receiver needs to open it, with no shared counter to keep in sync.
+//! A stateless authenticated-encryption envelope: [`StreamSiv`].
 //!
-//! The crypto layer operates on whatever bytes it is handed; the driver appends an 8-byte
-//! application replay nonce ONCE (see [`prepend_nonce`](crate::prepend_nonce)) before
-//! sealing, so the message every variant protects is `app_nonce(8) || message` and the reported
-//! overhead is pure crypto expansion, never payload. The variants differ only in the envelope:
+//! STATELESS means each message carries everything the receiver needs to open it -- there is no
+//! shared counter or session state to keep in sync. [`Protocol::seal`] turns a message into wire
+//! bytes; [`Protocol::open`] reverses it and rejects anything that fails authentication.
 //!
-//!   SignAead       sign-then-encrypt, AEAD tag       (+ non-repudiation; biggest)
-//!   SignStream     sign-then-encrypt, stream cipher  (+ non-repudiation, no tag)
-//!   AeadOnly       AEAD tag, random IV               (conf + sym-auth; textbook)
-//!   SivShortNonce  AEAD-SIV, 4-byte random nonce     (conf + sym-auth; compact)
-//!   StreamSiv<N>   stream cipher + truncated HMAC; the tag doubles as the IV
-//!   StreamOnly     stream cipher, random IV, no auth (conf only; malleable)
-//!   StreamRaw      stream cipher, fixed IV, no auth  (broken; size-floor demo)
+//! # The envelope
 //!
-//! THE CENTRAL TRADEOFFS (why the table looks the way it does)
+//! [`StreamSiv<S, N>`] is MAC-then-encrypt with a *synthetic IV*. It HMACs the plaintext, ships the
+//! leftmost `N` bytes of that tag, and reuses those same bytes to seed the stream cipher's IV. One
+//! shipped value does double duty -- integrity tag AND IV seed -- so the wire layout is just
+//! `tag(N) || ciphertext` and the crypto overhead is exactly `N` bytes. `S` is the stream cipher
+//! (e.g. ChaCha20); `N` is the tag width in bytes.
+//!
+//! # Usage
+//!
+//! The crypto layer operates on opaque bytes. The driver frames the message and checks for replays;
+//! the `Protocol` never adds a nonce of its own:
+//!
+//! ```ignore
+//! let proto  = StreamSiv::<ChaCha20, 4>::new(base_key)?;
+//! let framed = prepend_nonce(message)?;    // append 8-byte replay nonce, ONCE
+//! let wire   = proto.seal(&framed)?;        // -> tag(N) || ciphertext
+//! // ...send `wire`, then on the receiver...
+//! let framed = proto.open(&wire)?;          // verify tag, decrypt (or Err)
+//! check_and_record_nonce(&framed[..APP_NONCE_LEN], base_key)?;  // reject replays
+//! ```
+//!
+//! # Why it is shaped this way
 //!
 //! * Authentication needs a SECRET key. An unkeyed hash/checksum over the ciphertext catches
 //!   accidental corruption but is trivially forged by an active attacker (who just recomputes it)
-//!   -- so it is NOT integrity. Every authenticated variant here uses a keyed MAC (HMAC) or a
-//!   signature.
+//!   -- so it is NOT integrity. `StreamSiv` uses a keyed MAC (HMAC-SHA256).
 //!
 //! * A stream cipher needs a UNIQUE nonce per message, or its keystream repeats and `ct1 ^ ct2`
-//!   leaks `pt1 ^ pt2` (see StreamRaw / the nonce-reuse demo). A nonce buried in the *plaintext*
-//!   does NOT help -- it is XORed by the same keystream. The nonce has to drive the cipher's IV
-//!   input.
+//!   leaks `pt1 ^ pt2`. A nonce buried in the *plaintext* does NOT help -- it is XORed by the same
+//!   keystream. The nonce has to drive the cipher's IV input, which is what the synthetic IV does.
 //!
-//! * Stateless => the bytes that reconstruct the IV must be ON THE WIRE. The SIV variants make the
-//!   single truncated tag do double duty: it is both the integrity check AND the IV seed. One
-//!   shipped value, but it ties the two strengths together -- N shipped bytes give BOTH ~2^-8N
-//!   forgery resistance AND a ~2^(4N) keystream-reuse birthday bound (capped at the cipher's IV
-//!   width). You cannot ship 6 bytes and still get a strong 12-byte IV; the unsent bytes are
-//!   invisible to the receiver.
+//! * Stateless => the bytes that reconstruct the IV must be ON THE WIRE. Making the truncated tag
+//!   do double duty ties the two strengths together: N shipped bytes give BOTH ~2^-8N forgery
+//!   resistance AND a ~2^(4N) keystream-reuse birthday bound (capped at the cipher's IV width). You
+//!   cannot ship 6 bytes and still get a strong 12-byte IV; the unsent bytes are invisible to the
+//!   receiver.
 //!
-//! * Misuse-resistant AEAD (AES-GCM-SIV) is the one escape hatch: a nonce collision there costs
-//!   only an equality leak, not a keystream break, which is why SivShortNonce survives on a 4-byte
-//!   nonce where a raw stream cipher cannot.
+//! * `StreamSiv` is deterministic, not misuse-resistant: re-sealing a byte-identical message
+//!   repeats the wire bytes (an equality leak) and a nonce collision *is* a keystream break. That is
+//!   why [`prepend_nonce`] is load-bearing -- the per-message app nonce is what makes the synthetic
+//!   IV differ between otherwise-identical messages.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -234,7 +243,7 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
 }
 
 // ============================================================================
-// Variant 7: StreamSiv  (stateless: synthetic IV derived from a truncated MAC)
+// StreamSiv  (stateless: synthetic IV derived from a truncated MAC)
 //
 // MAC-then-encrypt over whatever message it is handed (the driver has already folded in the app
 // nonce). The HMAC is taken over the PLAINTEXT and the N bytes we ship do double duty: they are the
