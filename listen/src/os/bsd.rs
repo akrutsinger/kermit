@@ -1,4 +1,4 @@
-// TODO: rewrite for no_std — currently uses std::io, Vec, and format!().
+// TODO: rewrite for no_std; currently uses std::io, Vec, and format!().
 // try_recv() needs O_NONBLOCK on the BPF fd + EAGAIN handling (similar to linux).
 
 use std::io;

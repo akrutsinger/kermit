@@ -1,4 +1,4 @@
-//! Embassy async runtime -- the embedded seam, NOT built by default.
+//! Embassy async runtime: the embedded seam, not built by default.
 //!
 //! This is the single-threaded cooperative path: an `embassy_executor` raw
 //! executor driven by a platform `Reactor` that sleeps the core until a task
@@ -30,8 +30,8 @@ unsafe impl critical_section::Impl for CritSec {
 }
 
 /// Drives the executor to sleep when no task can make progress, and back awake
-/// when one can. Everything OS-specific -- epoll/eventfd on Linux, IOCP on
-/// Windows, WFE on bare metal -- lives behind this trait so the executor itself
+/// when one can. Everything OS-specific (epoll/eventfd on Linux, IOCP on
+/// Windows, WFE on bare metal) lives behind this trait so the executor itself
 /// stays generic.
 pub trait Reactor {
     /// Opaque pointer handed to `embassy_executor::raw::Executor::new` and passed
@@ -65,18 +65,16 @@ impl Executor {
     }
 }
 
-// ============================================================================
 // Linux reactor: epoll over the eventfd (executor wakeups) and the capture
 // socket. Readiness for the socket is published through the statics below,
 // which the (future, non-blocking) `Source::readable` future consumes.
-// ============================================================================
 
 const TOKEN_EVENTFD: u64 = 0;
 const TOKEN_SOCKET: u64 = 1;
 
 // Set by the reactor when epoll reports the socket readable; consumed by the
 // socket's readable future. Single-threaded executor, so the flag plus a single
-// waker slot is enough -- task polls and `wait` never run concurrently.
+// waker slot is enough: task polls and `wait` never run concurrently.
 static SOCKET_READY: AtomicBool = AtomicBool::new(false);
 static SOCKET_WAKER: AtomicWaker = AtomicWaker::new();
 
@@ -153,7 +151,7 @@ impl Reactor for LinuxReactor {
 
 // Called by embassy when any task's waker fires. Writes to the eventfd so the
 // reactor's epoll_wait unblocks and the executor polls again.
-// Must NOT call poll() directly -- see embassy_executor::raw::Executor docs.
+// Must not call poll() directly; see embassy_executor::raw::Executor docs.
 #[cfg(feature = "linux")]
 #[unsafe(export_name = "__pender")]
 fn __pender(context: *mut ()) {

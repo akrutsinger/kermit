@@ -1,6 +1,6 @@
-// TODO: rewrite for no_std — currently uses std::io, Vec, std::net, and std::ffi.
+// TODO: rewrite for no_std; currently uses std::io, Vec, std::net, and std::ffi.
 // try_recv() needs non-blocking mode (FIONBIO/ioctlsocket) + WSAEWOULDBLOCK mapped to Ok(None).
-// ListenError::Io wraps rustix::io::Errno, not std::io::ErrorKind — all error conversions need fixing.
+// ListenError::Io wraps rustix::io::Errno, not std::io::ErrorKind, so all error conversions need fixing.
 
 // Windows packet listener via SIO_RCVALL on a raw IPv4 socket.
 //
@@ -11,7 +11,7 @@
 //   - Requires Administrator privileges.
 //   - No kernel cBPF filter; we filter in userspace inside `recv`.
 //
-// The `iface` argument is the local IPv4 address to bind to (e.g. "192.168.1.5"), not a NIC name —
+// The `iface` argument is the local IPv4 address to bind to (e.g. "192.168.1.5"), not a NIC name;
 // Windows binds raw sockets by address.
 
 use std::ffi::c_void;
@@ -67,7 +67,7 @@ impl PacketSource for Source {
         let addr_str = iface.ok_or(ListenError::NoIface)?;
         let ip: Ipv4Addr = addr_str.parse().map_err(|_| ListenError::InvalidAddr)?;
 
-        // socket(AF_INET, SOCK_RAW, 0)  — protocol=None → 0 = IPPROTO_IP
+        // socket(AF_INET, SOCK_RAW, 0): protocol=None becomes 0 = IPPROTO_IP
         let fd = socket_with(
             AddressFamily::INET,
             SocketType::RAW,

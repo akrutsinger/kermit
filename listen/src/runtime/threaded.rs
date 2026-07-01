@@ -1,7 +1,7 @@
 //! Thread-pool runtime for hosted OSes. A dedicated recv loop (the calling
 //! thread) blocks on the socket and pushes frames into a bounded queue; a pool
 //! of `workers` pthreads drains the queue and runs the handler. This gives true
-//! parallelism -- a CPU-bound handler no longer stalls packet capture -- and
+//! parallelism (a CPU-bound handler no longer stalls packet capture) and
 //! decouples the two stages so a slow handler just backs up the bounded queue
 //! (oldest-wins: a full queue drops the new frame) instead of blocking recv.
 //!
@@ -39,7 +39,7 @@ impl Frame {
 
 /// Drive the capture loop to completion. Spawns `workers` (clamped to >= 1)
 /// handler threads, then runs the blocking recv loop on the calling thread.
-/// Returns when `src.recv` reports a fatal error -- for a real socket that is
+/// Returns when `src.recv` reports a fatal error; for a real socket that is
 /// effectively never, so this parks the main thread for the program's life.
 pub fn run<S, H>(mut src: S, handler: H, workers: usize) -> Result<(), ListenError>
 where
@@ -92,9 +92,7 @@ where
     result
 }
 
-// ============================================================================
 // Bounded blocking queue: pthread mutex + condvar around a fixed ring.
-// ============================================================================
 
 struct Ring {
     slots: Vec<Frame>,
@@ -195,9 +193,7 @@ impl Drop for Queue {
     }
 }
 
-// ============================================================================
 // Minimal pthread spawn/join wrapper.
-// ============================================================================
 
 struct Thread {
     handle: libc::pthread_t,
@@ -275,8 +271,8 @@ mod tests {
     // while a previous handler is still running. Each handler bumps `in_flight`,
     // then rendezvous on the monotonic `arrived` count: with two workers both
     // are still in flight when released, so `max_in_flight` reaches 2. A serial
-    // pool runs them back to back -- the first leaves (in_flight back to 0)
-    // before the second arrives -- so the high-water mark stays at 1.
+    // pool runs them back to back: the first leaves (in_flight back to 0)
+    // before the second arrives, so the high-water mark stays at 1.
     #[test]
     fn handlers_run_concurrently() {
         let gate = Arc::new((Mutex::new(Gate::default()), Condvar::new()));

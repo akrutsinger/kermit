@@ -1,9 +1,9 @@
 //! Concurrency runtime, selected at compile time and orthogonal to the OS axis
 //! in `os`. Exactly one runtime feature must be enabled:
 //!
-//!   runtime-threads  -- OS thread pool (pthreads); the hosted default.
-//!   runtime-embassy  -- embassy async executor for embedded (future; the
-//!                       module is preserved as a seam and not built by default).
+//!   runtime-threads: OS thread pool (pthreads); the hosted default.
+//!   runtime-embassy: embassy async executor for embedded (future; the module
+//!                    is preserved as a seam and not built by default).
 
 #[cfg(not(any(feature = "runtime-threads", feature = "runtime-embassy")))]
 compile_error!("listen: enable exactly one runtime feature: runtime-threads | runtime-embassy");
