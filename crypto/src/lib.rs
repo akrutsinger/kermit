@@ -258,6 +258,12 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
 //
 // So you cannot "compute 12 bytes but send 6 and keep a strong IV": the unsent bytes are invisible
 // to the receiver. (A misuse-resistant AEAD escapes this; a raw stream cipher cannot.)
+//
+// The ~2^(-8N) forgery bound is not just theory here: `forge_chosen_plaintext::<N>` in the tests
+// mounts a black-box chosen-plaintext forgery (no keys, only the `open` oracle plus one known
+// plaintext) and lands an attacker-chosen message in ~2^(8N) tries -- ~256 at N=1, ~65k at N=2.
+// That is why `holla` uses N=4 (~2^32 work): it is the floor where the brute force stops being
+// feasible.
 // ============================================================================
 
 pub struct StreamSiv<S, const N: usize> {
@@ -352,6 +358,107 @@ mod tests {
         // bit-identical -- the equality leak the module doc calls out.
         let p = proto();
         assert_eq!(p.seal(MSG).unwrap(), p.seal(MSG).unwrap());
+    }
+
+    /// Mount the chosen-plaintext forgery against `StreamSiv<ChaCha20, N>` and
+    /// return how many candidates were tried before the victim accepted OUR
+    /// chosen message. This is not a blind forgery (accepting unpredictable
+    /// garbage) -- it gets a message of the attacker's choosing accepted,
+    /// WITHOUT the keys.
+    ///
+    /// Ingredients:
+    ///   * one captured message whose plaintext is known (known-plaintext),
+    ///   * the `open` accept/reject oracle.
+    ///
+    /// Because it is a stream cipher, ct = pt XOR keystream(iv), so a known
+    /// (pt, ct) pair yields the keystream for that iv. The iv here IS the tag
+    /// (siv_iv), so any forgery that reuses the tag reuses this keystream --
+    /// letting the attacker encrypt an arbitrary chosen plaintext under it. The
+    /// only thing left is the N-byte MAC check, which passes for ~1/2^(8N)
+    /// plaintexts, so the attacker brute-forces a small filler region until it
+    /// hits. Expected work is therefore ~2^(8N): practical for N=1 (~256) and
+    /// N=2 (~65k), slow for N=3 (~16M), infeasible for N>=4 -- which is exactly
+    /// the security the tag length buys.
+    ///
+    /// This code never references enc_key/mac_key/mac_tag/siv_iv -- it only
+    /// calls `seal` (to model capturing a legit message) and `open` (the
+    /// victim's decrypt).
+    fn forge_chosen_plaintext<const N: usize>() -> u32 {
+        let p = StreamSiv::<ChaCha20, N>::new(KEY).unwrap();
+
+        // (1) Legit capture. `legit_pt` is the known plaintext.
+        let legit_pt = b"pay alice 5 coins";
+        let wire = p.seal(legit_pt).unwrap();
+        let (tag, ct) = wire.split_at(N);
+
+        // (2) Recover the keystream for iv = pad(tag): ks = ct XOR pt.
+        let ks: Vec<u8> = ct.iter().zip(legit_pt).map(|(c, m)| c ^ m).collect();
+
+        // (3) The message the attacker WANTS accepted, same length as the legit
+        // one so the recovered keystream lines up. The meaningful prefix is
+        // fixed; the trailing 4 bytes are filler we brute-force to satisfy the
+        // N-byte MAC. 4 filler bytes give a 2^32 candidate space, enough to
+        // almost-certainly contain a hit for N<=3.
+        const FILLER: usize = 4;
+        let prefix = b"PAY EVE ALL!!"; // len 13; 13 + 4 filler == 17 == legit len
+        assert_eq!(prefix.len() + FILLER, legit_pt.len());
+
+        let mut forged = Vec::from(&prefix[..]);
+        forged.extend_from_slice(&[0u8; FILLER]);
+
+        // Search ~64x the expected 2^(8N) tries so a miss is astronomically
+        // unlikely; clamp to the u32 filler space.
+        let cap = 64u64
+            .checked_shl(8 * N as u32)
+            .unwrap_or(u64::MAX)
+            .min(u32::MAX as u64) as u32;
+
+        for counter in 0..cap {
+            forged[prefix.len()..].copy_from_slice(&counter.to_le_bytes());
+            // Encrypt our chosen plaintext under the reused tag/keystream.
+            let ct_forged: Vec<u8> = forged.iter().zip(&ks).map(|(m, k)| m ^ k).collect();
+            let mut wire_forged = Vec::from(tag);
+            wire_forged.extend_from_slice(&ct_forged);
+
+            if let Ok(pt) = p.open(&wire_forged) {
+                // The oracle accepted OUR chosen, meaningful plaintext, not garbage.
+                assert_eq!(pt, forged);
+                assert!(forged.starts_with(prefix));
+                assert_ne!(forged.as_slice(), &legit_pt[..]);
+                return counter;
+            }
+        }
+        panic!("no {N}-byte tag collision found in {cap} tries");
+    }
+
+    #[test]
+    fn one_byte_tag_chosen_plaintext_forgery() {
+        let tries = forge_chosen_plaintext::<1>();
+        dbgprintln!("N=1 chosen-plaintext forgery succeeded after {tries} tries");
+    }
+
+    #[test]
+    fn two_byte_tag_chosen_plaintext_forgery() {
+        let tries = forge_chosen_plaintext::<2>();
+        dbgprintln!("N=2 chosen-plaintext forgery succeeded after {tries} tries");
+    }
+
+    // ~16M tries (~2^24): correct but slow, so it is opt-in. Run with:
+    //   cargo test -p crypto --release three_byte_tag -- --ignored --nocapture
+    #[test]
+    #[ignore = "brute-forces ~2^32 candidates; run explicitly"]
+    fn three_byte_tag_chosen_plaintext_forgery() {
+        let tries = forge_chosen_plaintext::<3>();
+        dbgprintln!("N=3 chosen-plaintext forgery succeeded after {tries} tries");
+    }
+
+    // ~4B tries (~2^32): correct but slow, so it is opt-in. Run with:
+    //   cargo test -p crypto --release four_byte_tag -- --ignored --nocapture
+    #[test]
+    #[ignore = "brute-forces ~2^32 candidates; run explicitly"]
+    fn four_byte_tag_chosen_plaintext_forgery() {
+        let tries = forge_chosen_plaintext::<4>();
+        dbgprintln!("N=4 chosen-plaintext forgery succeeded after {tries} tries");
     }
 
     #[test]
