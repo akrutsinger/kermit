@@ -51,11 +51,7 @@ static ALLOCATOR: LibcAlloc = LibcAlloc;
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    #[cfg(debug_assertions)]
-    {
-        use core::fmt::Write as _;
-        let _ = core::writeln!(common::StdoutWriter, "panic: {info}");
-    }
+    dbgprintln!("panic: {info}");
     unsafe { libc::abort() }
 }
 

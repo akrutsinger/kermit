@@ -18,5 +18,9 @@ macro_rules! dbgprintln {
             let _ = core::write!($crate::StdoutWriter, $($arg)*);
             let _ = $crate::StdoutWriter.write_str("\n");
         }
+        // Release: emit nothing, but still reference the args so variables that exist only to be
+        // logged don't trip `unused_variables`.
+        #[cfg(not(debug_assertions))]
+        let _ = core::format_args!($($arg)*);
     }};
 }
