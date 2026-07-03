@@ -11,7 +11,7 @@ mod source;
 #[cfg(not(test))]
 use common::dbgprintln;
 #[cfg(not(test))]
-use crypto::{APP_NONCE_LEN, check_and_record_nonce};
+use crypto::check_and_record_nonce;
 #[cfg(not(test))]
 use getrandom::fill;
 #[cfg(not(test))]
@@ -68,7 +68,9 @@ fn handle_packet(pkt: &[u8]) {
     dbgprintln!("matched: {} bytes", pkt.len());
 
     let base_key = *b"listen-test-key-0000000000000000";
-    let mut nonce = [0u8; APP_NONCE_LEN];
+    // Replay-nonce width for this demo; matches the default `StreamAead` NONCE_LEN parameter.
+    const REPLAY_NONCE_LEN: usize = 8;
+    let mut nonce = [0u8; REPLAY_NONCE_LEN];
     if let Err(e) = fill(&mut nonce) {
         dbgprintln!("failed to generate nonce: {e}");
         return;

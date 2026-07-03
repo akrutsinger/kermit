@@ -1,4 +1,4 @@
-//! A stateless authenticated-encryption envelope: [`StreamSiv`].
+//! A stateless authenticated-encryption envelope: [`StreamAead`].
 //!
 //! Stateless means each message carries everything the receiver needs to open it; there is no
 //! shared counter or session state to keep in sync. [`Protocol::seal`] turns a message into wire
@@ -6,46 +6,47 @@
 //!
 //! # The envelope
 //!
-//! [`StreamSiv<S, N>`] is MAC-then-encrypt with a synthetic IV. It HMACs the plaintext, ships the
-//! leftmost `N` bytes of that tag, and reuses those same bytes to seed the stream cipher's IV. The
-//! one shipped value is both the integrity tag and the IV seed, so the wire layout is `tag(N) ||
-//! ciphertext` and the crypto overhead is exactly `N` bytes. `S` is the stream cipher (e.g.
-//! ChaCha20); `N` is the tag width in bytes.
+//! [`StreamAead<S, NONCE_LEN, TAG_LEN>`] is encrypt-then-MAC with an explicit per-message nonce.
+//! `seal` draws a fresh random `NONCE_LEN`-byte nonce, uses it as the stream cipher's IV
+//! (zero-padded to the cipher's IV width), encrypts, then MACs `nonce ‖ ciphertext`. The wire
+//! layout is `nonce(NONCE_LEN) ‖ tag(TAG_LEN) ‖ ciphertext` and the crypto overhead is `NONCE_LEN +
+//! TAG_LEN` bytes. `S` is the stream cipher (e.g. ChaCha20); `NONCE_LEN` and `TAG_LEN` are
+//! independent width knobs.
 //!
 //! # Usage
 //!
-//! The crypto layer operates on opaque bytes. The driver frames the message and checks for replays;
-//! the `Protocol` never adds a nonce of its own:
+//! The crypto layer produces and parses the wire nonce; the driver only checks it for replays:
 //!
 //! ```ignore
-//! let proto  = StreamSiv::<ChaCha20, 4>::new(base_key)?;
-//! let framed = prepend_nonce(message)?;    // append 8-byte replay nonce, once
-//! let wire   = proto.seal(&framed)?;        // -> tag(N) || ciphertext
+//! let proto = StreamAead::<ChaCha20, 8, 4>::new(base_key)?;
+//! let wire  = proto.seal(message)?;               // -> nonce ‖ tag ‖ ciphertext
 //! // ...send `wire`, then on the receiver...
-//! let framed = proto.open(&wire)?;          // verify tag, decrypt (or Err)
-//! check_and_record_nonce(&framed[..APP_NONCE_LEN], base_key)?;  // reject replays
+//! let (nonce, message) = proto.open(&wire)?;       // verify tag, decrypt (or Err)
+//! check_and_record_nonce(&nonce, base_key)?;       // reject replays, gated behind open()
 //! ```
 //!
 //! # Why it is shaped this way
 //!
 //! * Authentication needs a secret key. An unkeyed hash over the ciphertext catches accidental
 //!   corruption, but an active attacker can just recompute it, so it provides no integrity.
-//!   `StreamSiv` uses a keyed MAC (HMAC-SHA256).
+//!   `StreamAead` uses a keyed MAC (HMAC-SHA256).
 //!
 //! * A stream cipher needs a unique nonce per message, or its keystream repeats and `ct1 ^ ct2`
-//!   leaks `pt1 ^ pt2`. A nonce buried in the plaintext does not help, since it is XORed by the same
-//!   keystream; the nonce has to drive the cipher's IV input, which is what the synthetic IV does.
+//!   leaks `pt1 ^ pt2`. The explicit nonce drives the cipher's IV directly, so byte-identical
+//!   messages still encrypt differently.
 //!
-//! * Because the envelope is stateless, the bytes that reconstruct the IV must be on the wire.
-//!   Reusing the truncated tag as the IV seed ties the two strengths together: the `N` shipped bytes
-//!   give both ~2^-8N forgery resistance and a ~2^4N keystream-reuse birthday bound (capped at the
-//!   cipher's IV width). Shipping fewer bytes than are computed buys nothing, because the unsent
-//!   bytes are invisible to the receiver.
+//! * Encrypt-then-MAC over `nonce ‖ ciphertext` lets the receiver verify before it decrypts, so the
+//!   cipher never runs on unauthenticated bytes. The nonce is in the MAC input, so an attacker
+//!   cannot swap the cleartext nonce to steer decryption without invalidating the tag.
 //!
-//! * `StreamSiv` is deterministic, not misuse-resistant: re-sealing a byte-identical message
-//!   repeats the wire bytes (an equality leak), and a nonce collision is a keystream break. That is
-//!   why [`prepend_nonce`] is load-bearing: the per-message app nonce is what makes the synthetic
-//!   IV differ between otherwise-identical messages.
+//! * `NONCE_LEN` and `TAG_LEN` are decoupled. `NONCE_LEN` governs keystream-reuse resistance (a
+//!   random `NONCE_LEN`-byte nonce collides at the ~2^(4*NONCE_LEN) birthday bound); `TAG_LEN`
+//!   governs forgery resistance (~2^(8*TAG_LEN)). Size each against its own threat; neither pays
+//!   for the other. The default `NONCE_LEN = 8` gives a ~2^32 keystream-reuse bound — ample below
+//!   ~2^16 messages, the scale this protocol targets.
+//!
+//! * `StreamAead` is randomized, not deterministic: the fresh nonce makes re-sealing the same
+//!   message produce different wire bytes, so there is no equality leak.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -67,12 +68,6 @@ use sha2::Sha256;
 
 /// Number of recent nonces retained for replay detection.
 pub const NONCE_WINDOW: usize = 4;
-/// Length of the application-layer replay nonce that the driver prepends before sealing. This nonce
-/// is also stored in a file to detect replays.
-pub const APP_NONCE_LEN: usize = 8;
-
-/// On-disk layout size: `[head: u8][slot_0..slot_N-1]` where each slot is `APP_NONCE_LEN` bytes.
-const NONCE_FILE_LEN: usize = 1 + NONCE_WINDOW * APP_NONCE_LEN;
 
 /// ChaCha20 (IETF variant) uses a 96-bit nonce.
 const CHACHA20_NONCE_LEN: usize = 12;
@@ -104,9 +99,14 @@ impl core::fmt::Display for ProtoError {
 
 impl core::error::Error for ProtoError {}
 
+/// The seal/open envelope interface: turn a message into authenticated wire bytes and back.
 pub trait Protocol {
+    /// Turn `msg` into wire bytes: draw a fresh nonce, encrypt, then MAC. Returns
+    /// `nonce ‖ tag ‖ ciphertext`.
     fn seal(&self, msg: &[u8]) -> Result<Vec<u8>, ProtoError>;
-    fn open(&self, wire: &[u8]) -> Result<Vec<u8>, ProtoError>;
+    /// Verify and decrypt `wire`, returning `(nonce, plaintext)`. The nonce is returned because the
+    /// driver needs it for replay detection (see [`check_and_record_nonce`]).
+    fn open(&self, wire: &[u8]) -> Result<(Vec<u8>, Vec<u8>), ProtoError>;
 }
 
 // Shared primitives.
@@ -119,6 +119,7 @@ fn derive_key(base_key: &[u8], label: &[u8]) -> Result<[u8; 32], ProtoError> {
     Ok(k)
 }
 
+/// Separate encryption key from the same base, distinct HKDF label (key separation).
 pub fn derive_enc_key(base_key: &[u8]) -> Result<[u8; 32], ProtoError> {
     derive_key(base_key, b"seal:enc-key:v1")
 }
@@ -128,17 +129,22 @@ pub fn derive_mac_key(base_key: &[u8]) -> Result<[u8; 32], ProtoError> {
     derive_key(base_key, b"seal:mac-key:v1")
 }
 
-/// HMAC-SHA256 over `data`, truncated to the leftmost `n` bytes.
-fn mac_tag(mac_key: &[u8], data: &[u8], n: usize) -> Result<Vec<u8>, ProtoError> {
+/// HMAC-SHA256 over the concatenation of `parts`, truncated to the leftmost `n` bytes. Taking the
+/// parts as a slice lets callers MAC `nonce ‖ ct` without allocating a joined buffer.
+fn compute_tag(mac_key: &[u8], parts: &[&[u8]], n: usize) -> Result<Vec<u8>, ProtoError> {
     let mut m = Hmac::<Sha256>::new_from_slice(mac_key).map_err(|_| ProtoError::Init)?;
-    m.update(data);
+    for part in parts {
+        m.update(part);
+    }
     Ok(m.finalize().into_bytes()[..n].to_vec())
 }
 
-/// Constant-time verify of a left-truncated HMAC-SHA256 tag.
-fn mac_verify(mac_key: &[u8], data: &[u8], tag: &[u8]) -> Result<(), ProtoError> {
+/// Constant-time verify of a left-truncated HMAC-SHA256 tag over the concatenation of `parts`.
+fn verify_tag(mac_key: &[u8], parts: &[&[u8]], tag: &[u8]) -> Result<(), ProtoError> {
     let mut m = Hmac::<Sha256>::new_from_slice(mac_key).map_err(|_| ProtoError::Init)?;
-    m.update(data);
+    for part in parts {
+        m.update(part);
+    }
     m.verify_truncated_left(tag).map_err(|_| ProtoError::Mac)
 }
 
@@ -148,15 +154,6 @@ fn expand_short_nonce(len: usize, short: &[u8]) -> Vec<u8> {
     let mut n = vec![0u8; len];
     n[..short.len()].copy_from_slice(short);
     n
-}
-
-/// Build the synthetic IV from the tag: take its first `min(n, iv_len)` bytes and zero-pad up to
-/// the cipher's IV width. The IV carries only that many bytes of entropy, so shipping fewer tag
-/// bytes directly weakens nonce-collision resistance; the receiver can only rebuild the IV from
-/// bytes that are on the wire.
-fn siv_iv<S: KeyIvInit>(tag: &[u8], n: usize) -> Vec<u8> {
-    let iv_len = S::iv_size();
-    expand_short_nonce(iv_len, &tag[..n.min(iv_len)])
 }
 
 /// XOR `buf` in place with the keystream from cipher `S`. Used where a heap allocation for a new
@@ -172,27 +169,17 @@ fn stream_xor_in_place<S: KeyIvInit + StreamCipher>(
     Ok(())
 }
 
-/// Application-layer framing: append an 8-byte replay nonce to the message. Called once by the
-/// driver before any crypto; the `Protocol` impls treat the result as an opaque message and never
-/// add a nonce of their own. In the SIV variants this nonce is load-bearing: it is what makes the
-/// synthetic IV differ between otherwise-identical messages.
-pub fn prepend_nonce(msg: &[u8]) -> Result<Vec<u8>, ProtoError> {
-    let mut buf = Vec::with_capacity(APP_NONCE_LEN + msg.len());
-    let mut nonce = [0u8; APP_NONCE_LEN];
-    fill(&mut nonce).map_err(|_| ProtoError::Init)?;
-    buf.extend_from_slice(&nonce);
-    buf.extend_from_slice(msg);
-    Ok(buf)
-}
-
 /// Check the `/tmp/nonce` ring buffer for `nonce`; return `Err(NoncePresent)` if found, otherwise
-/// record it and return `Ok(())`.
+/// record it and return `Ok(())`. The slot size follows `nonce.len()`, so the same length must be
+/// used for the lifetime of the on-disk file (it is fixed by the `StreamAead` `NONCE_LEN`
+/// parameter).
 ///
-/// On-disk layout: 33 bytes of ChaCha20-encrypted ring buffer. Fixed zero IV is safe because the
-/// derived key is unique per session. Plaintext layout: `[head: u8][slot_0..slot_N-1]`.
+/// On-disk layout: `1 + NONCE_WINDOW * nonce.len()` bytes of ChaCha20-encrypted ring buffer. Fixed
+/// zero IV is safe because the derived key is unique per session. Plaintext layout: `[head:
+/// u8][slot_0..slot_N-1]`.
 pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), ProtoError> {
-    debug_assert_eq!(nonce.len(), APP_NONCE_LEN);
     let n = nonce.len();
+    let file_len = 1 + NONCE_WINDOW * n;
     let file_key = derive_key(base_key, b"nonce-file:key:v1")?;
     let iv = [0u8; CHACHA20_NONCE_LEN];
 
@@ -213,8 +200,8 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
     // dropped at the end of this function.
     flock(&fd, FlockOperation::LockExclusive).map_err(ProtoError::Io)?;
 
-    let mut ring = [0u8; NONCE_FILE_LEN];
-    if rustix::io::read(&fd, &mut ring).map_err(ProtoError::Io)? == NONCE_FILE_LEN {
+    let mut ring = vec![0u8; file_len];
+    if rustix::io::read(&fd, &mut ring[..]).map_err(ProtoError::Io)? == file_len {
         stream_xor_in_place::<ChaCha20>(&file_key, &iv, &mut ring)?;
     }
 
@@ -236,30 +223,46 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
     Ok(())
 }
 
-// StreamSiv: stateless, with a synthetic IV derived from a truncated MAC.
-//
-// The MAC covers the plaintext rather than the ciphertext for two reasons. The tag doubles as the
-// IV, so deriving the IV from the ciphertext would be circular (ct needs the IV, the IV would need
-// MAC(ct), and MAC(ct) needs ct). And the MAC stays keyed (HMAC), whereas an unkeyed hash here
-// would be forgeable and give no integrity.
-//
-// The forgery bound of ~2^-8N is exercised, not just asserted: `forge_chosen_plaintext::<N>` in the
-// tests mounts a black-box chosen-plaintext forgery using only the `open` oracle plus one known
-// plaintext, landing an attacker-chosen message in ~2^8N tries. That is why `holla` uses N=4 (~2^32
-// work): the point where brute force stops being feasible.
-
-pub struct StreamSiv<S, const N: usize> {
+/// Stateless authenticated-encryption envelope: encrypt-then-MAC with an explicit random nonce.
+///
+/// The MAC covers `nonce ‖ ciphertext` (encrypt-then-MAC), the composition with the strongest
+/// generic-composition guarantees: the receiver authenticates before decrypting, so the cipher
+/// never touches unauthenticated bytes, and the nonce is bound into the tag so it cannot be
+/// swapped.
+///
+/// The forgery bound of ~2^-8*TAG_LEN is exercised, not just asserted: `forge_chosen_plaintext` in
+/// the tests mounts a black-box chosen-plaintext forgery using only the `open` oracle plus one
+/// known plaintext, landing an attacker-chosen message in ~2^8*TAG_LEN tries. That is why a small
+/// TAG_LEN is weak against an attacker who can hammer the oracle, and why picking TAG_LEN is a
+/// threat-model decision.
+pub struct StreamAead<S, const NONCE_LEN: usize, const TAG_LEN: usize> {
     enc_key: [u8; 32],
     mac_key: [u8; 32],
     _p: PhantomData<S>,
 }
 
-impl<S, const N: usize> StreamSiv<S, N> {
+impl<S: KeyIvInit + StreamCipher, const NONCE_LEN: usize, const TAG_LEN: usize>
+    StreamAead<S, NONCE_LEN, TAG_LEN>
+{
     pub fn new(base_key: &[u8]) -> Result<Self, ProtoError> {
-        // N is the truncated-HMAC tag width; HMAC-SHA256 yields 32 bytes, so a larger N would slice
-        // past the digest and panic in `mac_tag`. The assert is wrapped in `const` so an
-        // out-of-range N is a compile-time error rather than a runtime panic.
-        const { assert!(N >= 1 && N <= 32, "StreamSiv N must be in 1..=32") };
+        // TAG_LEN is the truncated-HMAC width; HMAC-SHA256 yields 32 bytes, so a larger TAG_LEN
+        // would slice past the digest and panic in `compute_tag`. NONCE_LEN must be non-empty. Both
+        // are wrapped in `const` so an out-of-range value is a compile-time error rather than a
+        // runtime panic.
+        const {
+            assert!(
+                TAG_LEN >= 1 && TAG_LEN <= 32,
+                "StreamAead TAG_LEN must be in 1..=32"
+            )
+        };
+        const { assert!(NONCE_LEN >= 1, "StreamAead NONCE_LEN must be >= 1") };
+
+        // The nonce is zero-padded up to the cipher's IV width, so it cannot be wider than that; a
+        // wider NONCE_LEN would overflow the pad buffer in `expand_short_nonce`. `iv_size` is not
+        // const-evaluable, so this is a runtime check.
+        if NONCE_LEN > S::iv_size() {
+            return Err(ProtoError::Init);
+        }
 
         Ok(Self {
             enc_key: derive_enc_key(base_key)?,
@@ -267,33 +270,51 @@ impl<S, const N: usize> StreamSiv<S, N> {
             _p: PhantomData,
         })
     }
-}
 
-impl<S: KeyIvInit + StreamCipher, const N: usize> Protocol for StreamSiv<S, N> {
-    fn seal(&self, msg: &[u8]) -> Result<Vec<u8>, ProtoError> {
-        let tag = mac_tag(&self.mac_key, msg, N)?;
-        let iv = siv_iv::<S>(&tag, N);
+    /// Core of `seal` with the nonce supplied by the caller. `seal` wraps this with a fresh random
+    /// nonce; tests use it directly to pin a deterministic wire vector.
+    fn seal_with_nonce(&self, nonce: [u8; NONCE_LEN], msg: &[u8]) -> Result<Vec<u8>, ProtoError> {
+        let iv = expand_short_nonce(S::iv_size(), &nonce);
         let mut ct = msg.to_vec();
         S::new_from_slices(&self.enc_key, &iv)
             .map_err(|_| ProtoError::Init)?
             .apply_keystream(&mut ct);
-        let mut wire = tag;
+        // Encrypt-then-MAC: authenticate the nonce and the ciphertext.
+        let tag = compute_tag(&self.mac_key, &[&nonce, &ct], TAG_LEN)?;
+        let mut wire = Vec::with_capacity(NONCE_LEN + TAG_LEN + ct.len());
+        wire.extend_from_slice(&nonce);
+        wire.extend_from_slice(&tag);
         wire.extend_from_slice(&ct);
         Ok(wire)
     }
+}
 
-    fn open(&self, wire: &[u8]) -> Result<Vec<u8>, ProtoError> {
-        if wire.len() < N {
+impl<S: KeyIvInit + StreamCipher, const NONCE_LEN: usize, const TAG_LEN: usize> Protocol
+    for StreamAead<S, NONCE_LEN, TAG_LEN>
+{
+    fn seal(&self, msg: &[u8]) -> Result<Vec<u8>, ProtoError> {
+        let mut nonce = [0u8; NONCE_LEN];
+        fill(&mut nonce).map_err(|_| ProtoError::Init)?;
+        self.seal_with_nonce(nonce, msg)
+    }
+
+    fn open(&self, wire: &[u8]) -> Result<(Vec<u8>, Vec<u8>), ProtoError> {
+        if wire.len() < NONCE_LEN + TAG_LEN {
             return Err(ProtoError::TooShort);
         }
-        let (tag, ct) = wire.split_at(N);
-        let iv = siv_iv::<S>(tag, N);
-        let mut buf = ct.to_vec();
+        let nonce = &wire[..NONCE_LEN];
+        let tag = &wire[NONCE_LEN..NONCE_LEN + TAG_LEN];
+        let ct = &wire[NONCE_LEN + TAG_LEN..];
+
+        // Encrypt-then-MAC: verify before touching the cipher, so a forgery never reaches decrypt.
+        verify_tag(&self.mac_key, &[nonce, ct], tag)?;
+
+        let iv = expand_short_nonce(S::iv_size(), nonce);
+        let mut pt = ct.to_vec();
         S::new_from_slices(&self.enc_key, &iv)
             .map_err(|_| ProtoError::Init)?
-            .apply_keystream(&mut buf);
-        mac_verify(&self.mac_key, &buf, tag)?;
-        Ok(buf)
+            .apply_keystream(&mut pt);
+        Ok((nonce.to_vec(), pt))
     }
 }
 
@@ -304,18 +325,21 @@ mod tests {
 
     const KEY: &[u8] = b"kermit-crypto-unit-test-base-key";
     const MSG: &[u8] = b"hello, kermit!";
-    const N: usize = 4;
+    const NONCE_LEN: usize = 8;
+    const TAG_LEN: usize = 4;
 
-    fn proto() -> StreamSiv<ChaCha20, N> {
-        StreamSiv::<ChaCha20, N>::new(KEY).unwrap()
+    fn proto() -> StreamAead<ChaCha20, NONCE_LEN, TAG_LEN> {
+        StreamAead::<ChaCha20, NONCE_LEN, TAG_LEN>::new(KEY).unwrap()
     }
 
     #[test]
     fn round_trip() {
         let p = proto();
         let wire = p.seal(MSG).unwrap();
-        assert_eq!(wire.len(), N + MSG.len());
-        assert_eq!(p.open(&wire).unwrap(), MSG);
+        assert_eq!(wire.len(), NONCE_LEN + TAG_LEN + MSG.len());
+        let (nonce, pt) = p.open(&wire).unwrap();
+        assert_eq!(nonce.len(), NONCE_LEN);
+        assert_eq!(pt, MSG);
     }
 
     #[test]
@@ -327,102 +351,108 @@ mod tests {
     }
 
     #[test]
-    fn too_short() {
+    fn nonce_swap_rejected() {
+        // The nonce is in the MAC input, so flipping a cleartext-nonce byte fails the gate rather
+        // than silently steering decryption to a different keystream.
         let p = proto();
-        assert_eq!(p.open(&[0u8; N - 1]), Err(ProtoError::TooShort));
+        let mut wire = p.seal(MSG).unwrap();
+        wire[0] ^= 0x01;
+        assert_eq!(p.open(&wire), Err(ProtoError::Mac));
     }
 
     #[test]
-    fn deterministic() {
-        // The synthetic IV is HMAC(msg), so sealing the same message twice is bit-identical: the
-        // equality leak the module doc calls out.
+    fn too_short() {
         let p = proto();
-        assert_eq!(p.seal(MSG).unwrap(), p.seal(MSG).unwrap());
+        assert_eq!(
+            p.open(&[0u8; NONCE_LEN + TAG_LEN - 1]),
+            Err(ProtoError::TooShort)
+        );
     }
 
-    /// Mount the chosen-plaintext forgery against `StreamSiv<ChaCha20, N>` and return how many
-    /// candidates were tried before the victim accepted our chosen message. This is not a blind
-    /// forgery that accepts unpredictable garbage: it gets a message of the attacker's choosing
-    /// accepted without the keys.
+    #[test]
+    fn unique_per_seal() {
+        // A fresh random nonce per seal means the same message encrypts differently every time: no
+        // equality leak.
+        let p = proto();
+        assert_ne!(p.seal(MSG).unwrap(), p.seal(MSG).unwrap());
+    }
+
+    /// Mount the chosen-plaintext forgery against `StreamAead<ChaCha20, NONCE_LEN, TAG_LEN>` and
+    /// return how many tag guesses were tried before the victim accepted our chosen message. This
+    /// is not a blind forgery that accepts unpredictable garbage: it gets a message of the
+    /// attacker's choosing accepted without the keys.
     ///
     /// It needs one captured message whose plaintext is known, plus the `open` accept/reject
     /// oracle.
     ///
     /// Because it is a stream cipher, ct = pt XOR keystream(iv), so a known (pt, ct) pair yields
-    /// the keystream for that iv. The iv here is the tag (see `siv_iv`), so any forgery that reuses
-    /// the tag reuses this keystream, letting the attacker encrypt an arbitrary chosen plaintext
-    /// under it. All that is left is the N-byte MAC check, which passes for ~1/2^8N plaintexts, so
-    /// the attacker brute-forces a small filler region until one hits. Expected work is ~2^8N:
-    /// practical for N=1 (~256) and N=2 (~65k), slow for N=3 (~16M), infeasible for N>=4.
+    /// the keystream for that nonce. Reusing the captured nonce reuses that keystream, letting the
+    /// attacker encrypt an arbitrary chosen plaintext of the same length under it. All that is left
+    /// is the TAG_LEN-byte MAC over `nonce ‖ ct`: its correct value is fixed but unknown, so the
+    /// attacker brute-forces the tag field until `open` accepts. Expected work is ~2^8*TAG_LEN,
+    /// isolating TAG_LEN as the sole forgery knob: practical for TAG_LEN=1 (~256) and TAG_LEN=2
+    /// (~65k), slow for TAG_LEN=3 (~16M), infeasible for TAG_LEN>=4.
     ///
-    /// The attack never references enc_key/mac_key/mac_tag/siv_iv; it only calls `seal` (to model
+    /// The attack never references enc_key/mac_key/compute_tag; it only calls `seal` (to model
     /// capturing a legit message) and `open` (the victim's decrypt).
-    fn forge_chosen_plaintext<const N: usize>() -> u32 {
-        let p = StreamSiv::<ChaCha20, N>::new(KEY).unwrap();
+    fn forge_chosen_plaintext<const NONCE_LEN: usize, const TAG_LEN: usize>() -> u64 {
+        let p = StreamAead::<ChaCha20, NONCE_LEN, TAG_LEN>::new(KEY).unwrap();
 
         // (1) Legit capture. `legit_pt` is the known plaintext.
         let legit_pt = b"pay alice 5 coins";
         let wire = p.seal(legit_pt).unwrap();
-        let (tag, ct) = wire.split_at(N);
+        let nonce = &wire[..NONCE_LEN];
+        let ct = &wire[NONCE_LEN + TAG_LEN..];
 
-        // (2) Recover the keystream for iv = pad(tag): ks = ct XOR pt.
+        // (2) Recover the keystream for this nonce: ks = ct XOR pt.
         let ks: Vec<u8> = ct.iter().zip(legit_pt).map(|(c, m)| c ^ m).collect();
 
         // (3) The message the attacker wants accepted, same length as the legit one so the
-        // recovered keystream lines up. The meaningful prefix is fixed; the trailing 4 bytes are
-        // filler we brute-force to satisfy the N-byte MAC. 4 filler bytes give a 2^32 candidate
-        // space, enough to almost-certainly contain a hit for N<=3.
-        const FILLER: usize = 4;
-        let prefix = b"PAY EVE ALL!!"; // len 13; 13 + 4 filler == 17 == legit len
-        assert_eq!(prefix.len() + FILLER, legit_pt.len());
+        // recovered keystream lines up. Encrypting it under the reused nonce fixes the ciphertext,
+        // so the only unknown left is the tag.
+        let forged_pt = b"PAY EVE 999 coins";
+        assert_eq!(forged_pt.len(), legit_pt.len());
+        assert_ne!(&forged_pt[..], &legit_pt[..]);
+        let ct_forged: Vec<u8> = forged_pt.iter().zip(&ks).map(|(m, k)| m ^ k).collect();
 
-        let mut forged = Vec::from(&prefix[..]);
-        forged.extend_from_slice(&[0u8; FILLER]);
-
-        // Search ~64x the expected 2^(8N) tries so a miss is astronomically unlikely; clamp to the
-        // u32 filler space.
-        let cap = 64u64
-            .checked_shl(8 * N as u32)
-            .unwrap_or(u64::MAX)
-            .min(u32::MAX as u64) as u32;
-
-        for counter in 0..cap {
-            forged[prefix.len()..].copy_from_slice(&counter.to_le_bytes());
-            // Encrypt our chosen plaintext under the reused tag/keystream.
-            let ct_forged: Vec<u8> = forged.iter().zip(&ks).map(|(m, k)| m ^ k).collect();
-            let mut wire_forged = Vec::from(tag);
+        // Brute-force the TAG_LEN-byte tag field. The correct tag is a single fixed value, so
+        // exhausting the 2^8*TAG_LEN space is guaranteed to hit it.
+        let cap: u64 = 1u64 << (8 * TAG_LEN as u64);
+        for guess in 0..cap {
+            let tag_bytes = &guess.to_le_bytes()[..TAG_LEN];
+            let mut wire_forged = Vec::with_capacity(NONCE_LEN + TAG_LEN + ct_forged.len());
+            wire_forged.extend_from_slice(nonce);
+            wire_forged.extend_from_slice(tag_bytes);
             wire_forged.extend_from_slice(&ct_forged);
 
-            if let Ok(pt) = p.open(&wire_forged) {
+            if let Ok((_n, pt)) = p.open(&wire_forged) {
                 // The oracle accepted our chosen, meaningful plaintext, not garbage.
-                assert_eq!(pt, forged);
-                assert!(forged.starts_with(prefix));
-                assert_ne!(forged.as_slice(), &legit_pt[..]);
-                return counter;
+                assert_eq!(pt, forged_pt);
+                return guess;
             }
         }
-        panic!("no {N}-byte tag collision found in {cap} tries");
+        panic!("no {TAG_LEN}-byte tag found in {cap} tries");
     }
 
     #[test]
     fn one_byte_tag_chosen_plaintext_forgery() {
-        let tries = forge_chosen_plaintext::<1>();
-        dbgprintln!("N=1 chosen-plaintext forgery succeeded after {tries} tries");
+        let tries = forge_chosen_plaintext::<8, 1>();
+        dbgprintln!("TAG_LEN=1 chosen-plaintext forgery succeeded after {tries} tries");
     }
 
     #[test]
     fn two_byte_tag_chosen_plaintext_forgery() {
-        let tries = forge_chosen_plaintext::<2>();
-        dbgprintln!("N=2 chosen-plaintext forgery succeeded after {tries} tries");
+        let tries = forge_chosen_plaintext::<8, 2>();
+        dbgprintln!("TAG_LEN=2 chosen-plaintext forgery succeeded after {tries} tries");
     }
 
     // ~16M tries (~2^24): correct but slow, so it is opt-in. Run with:
     //   cargo test -p crypto --release three_byte_tag -- --ignored --nocapture
     #[test]
-    #[ignore = "brute-forces ~2^32 candidates; run explicitly"]
+    #[ignore = "brute-forces ~2^24 candidates; run explicitly"]
     fn three_byte_tag_chosen_plaintext_forgery() {
-        let tries = forge_chosen_plaintext::<3>();
-        dbgprintln!("N=3 chosen-plaintext forgery succeeded after {tries} tries");
+        let tries = forge_chosen_plaintext::<8, 3>();
+        dbgprintln!("TAG_LEN=3 chosen-plaintext forgery succeeded after {tries} tries");
     }
 
     // ~4B tries (~2^32): correct but slow, so it is opt-in. Run with:
@@ -430,19 +460,21 @@ mod tests {
     #[test]
     #[ignore = "brute-forces ~2^32 candidates; run explicitly"]
     fn four_byte_tag_chosen_plaintext_forgery() {
-        let tries = forge_chosen_plaintext::<4>();
-        dbgprintln!("N=4 chosen-plaintext forgery succeeded after {tries} tries");
+        let tries = forge_chosen_plaintext::<8, 4>();
+        dbgprintln!("TAG_LEN=4 chosen-plaintext forgery succeeded after {tries} tries");
     }
 
     #[test]
     fn wire_format_snapshot() {
-        // Golden vector pinning the on-wire bytes for the fixed KEY/MSG/N above (tag(4) || ct(14)).
+        // Golden vector pinning the on-wire bytes for the fixed KEY/MSG/NONCE_LEN/TAG_LEN above,
+        // with a fixed nonce injected so the output is deterministic (nonce(8) ‖ tag(4) ‖ ct(14)).
         // Regenerate intentionally if the envelope changes.
         let p = proto();
-        let expected: [u8; N + MSG.len()] = [
-            0xf2, 0x8a, 0x06, 0xa6, 0xe0, 0x39, 0xee, 0xe8, 0x48, 0xa3, 0x3d, 0x15, 0xf0, 0x73,
-            0x34, 0xdd, 0x29, 0x7e,
+        let nonce = [0x11u8; NONCE_LEN];
+        let expected: [u8; NONCE_LEN + TAG_LEN + MSG.len()] = [
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x03, 0x95, 0x88, 0x55, 0xf4, 0xbd,
+            0x0a, 0x9a, 0xe2, 0xf4, 0x2c, 0x10, 0xdf, 0xcf, 0x57, 0x9a, 0x2b, 0x9b,
         ];
-        assert_eq!(p.seal(MSG).unwrap(), expected);
+        assert_eq!(p.seal_with_nonce(nonce, MSG).unwrap(), expected);
     }
 }
