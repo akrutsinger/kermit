@@ -129,8 +129,9 @@ impl Reactor for LinuxReactor {
 
     fn wait(&self) {
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
-        let n =
-            unsafe { libc::epoll_wait(self.epoll_fd, events.as_mut_ptr(), events.len() as i32, -1) };
+        let n = unsafe {
+            libc::epoll_wait(self.epoll_fd, events.as_mut_ptr(), events.len() as i32, -1)
+        };
 
         for ev in &events[..n.max(0) as usize] {
             match ev.u64 {

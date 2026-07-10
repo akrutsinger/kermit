@@ -11,24 +11,20 @@ mod source;
 #[cfg(not(test))]
 use common::dbgprintln;
 #[cfg(not(test))]
+use crypto::NONCE_WINDOW;
+#[cfg(not(test))]
 use crypto::check_and_record_nonce;
 #[cfg(not(test))]
 use getrandom::fill;
 #[cfg(not(test))]
 use source::PacketSource as _;
 
-// The embassy runtime is preserved as a seam (see runtime/embassy.rs) but is
-// not yet wired into `main`; fail loudly rather than with a confusing error.
+// The embassy runtime is preserved as a seam (see runtime/embassy.rs) but is not yet wired into
+// `main`; fail loudly rather than with a confusing error.
 #[cfg(all(not(test), feature = "runtime-embassy"))]
 compile_error!(
     "listen: runtime-embassy is a future seam, not yet wired into main; build with runtime-threads"
 );
-
-/// Worker threads draining the capture queue. Handlers run in parallel across
-/// these; shared state they touch (the replay-nonce file) is serialized inside
-/// `check_and_record_nonce` via `flock`.
-#[cfg(all(not(test), feature = "runtime-threads"))]
-const WORKERS: usize = 4;
 
 #[cfg(not(test))]
 struct LibcAlloc;
@@ -61,8 +57,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn rust_eh_personality() {}
 
-/// Per-packet handler, run on a worker thread. The burn loop stands in for real
-/// processing so concurrent capture is observable while testing.
+/// Per-packet handler, run on its own spawned thread. The burn loop stands in for real processing
+/// so concurrent capture is observable while testing.
 #[cfg(all(not(test), feature = "runtime-threads"))]
 fn handle_packet(pkt: &[u8]) {
     dbgprintln!("matched: {} bytes", pkt.len());
@@ -113,7 +109,9 @@ extern "C" fn main(argc: i32, argv: *const *const u8) -> i32 {
         return 1;
     }
 
-    match runtime::run(src, handle_packet, WORKERS) {
+    // Cap concurrent handlers at the replay-nonce window: no point admitting more in-flight packets
+    // than the number of nonces `check_and_record_nonce` remembers.
+    match runtime::run(src, handle_packet, NONCE_WINDOW) {
         Ok(()) => 0,
         Err(e) => {
             dbgprintln!("capture stopped: {e}");

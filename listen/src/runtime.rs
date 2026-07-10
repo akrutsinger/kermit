@@ -1,7 +1,8 @@
-//! Concurrency runtime, selected at compile time and orthogonal to the OS axis
-//! in `os`. Exactly one runtime feature must be enabled:
+//! Concurrency runtime, selected at compile time and orthogonal to the OS axis in `os`. Exactly one
+//! runtime feature must be enabled:
 //!
-//!   runtime-threads: OS thread pool (pthreads); the hosted default.
+//!   runtime-threads: one OS thread per packet, capped by the caller; the
+//!                    hosted default.
 //!   runtime-embassy: embassy async executor for embedded (future; the module
 //!                    is preserved as a seam and not built by default).
 
