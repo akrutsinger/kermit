@@ -80,7 +80,7 @@ pub enum ProtoError {
     TooShort,
     Mac,
     NoncePresent,
-    Io(rustix::io::Errno),
+    Io,
     Init,
 }
 
@@ -91,7 +91,7 @@ impl core::fmt::Display for ProtoError {
             ProtoError::TooShort => _f.write_str("input too short")?,
             ProtoError::Mac => _f.write_str("mac verification failed")?,
             ProtoError::NoncePresent => _f.write_str("nonce already present (replay detected)")?,
-            ProtoError::Io(errno) => write!(_f, "i/o error: {errno:?}")?,
+            ProtoError::Io => _f.write_str("i/o error")?,
             ProtoError::Init => _f.write_str("crypto primitive init failed")?,
         }
         Ok(())
@@ -223,27 +223,31 @@ fn with_locked_ring<T>(
     len: usize,
     f: impl FnOnce(&mut Vec<u8>, bool) -> Result<T, ProtoError>,
 ) -> Result<T, ProtoError> {
+    // The typed errno is diagnostic-only (nothing branches on it), so it's logged here and erased to
+    // the payload-free marker (ADR-0003).
+    fn io_err(e: rustix::io::Errno) -> ProtoError {
+        dbgprintln!("nonce io: {e:?}");
+        ProtoError::Io
+    }
+
     let fd = rustix::fs::open(
         c"/tmp/nonce",
         OFlags::RDWR | OFlags::CREATE,
         Mode::RUSR | Mode::WUSR,
     )
-    .map_err(|e| {
-        dbgprintln!("nonce open: {e:?}");
-        ProtoError::Io(e)
-    })?;
+    .map_err(io_err)?;
 
     // LOCK_EX serializes the whole critical section; the lock releases when `fd` is dropped at the
     // end of this function.
-    flock(&fd, FlockOperation::LockExclusive).map_err(ProtoError::Io)?;
+    flock(&fd, FlockOperation::LockExclusive).map_err(io_err)?;
 
     let mut ring = vec![0u8; len];
-    let had_prior_content = rustix::io::read(&fd, &mut ring[..]).map_err(ProtoError::Io)? == len;
+    let had_prior_content = rustix::io::read(&fd, &mut ring[..]).map_err(io_err)? == len;
 
     let result = f(&mut ring, had_prior_content)?;
 
-    rustix::fs::seek(&fd, SeekFrom::Start(0)).map_err(ProtoError::Io)?;
-    rustix::io::write(&fd, &ring).map_err(ProtoError::Io)?;
+    rustix::fs::seek(&fd, SeekFrom::Start(0)).map_err(io_err)?;
+    rustix::io::write(&fd, &ring).map_err(io_err)?;
     Ok(result)
 }
 

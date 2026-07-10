@@ -1,5 +1,6 @@
 use core::num::NonZeroU32;
 
+use common::dbgprintln;
 use rustix::fd::{AsRawFd, OwnedFd};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, Protocol, RecvFlags, SocketFlags, SocketType, socket_with};
@@ -8,6 +9,13 @@ use crate::filter::SockFilter;
 use crate::source::{ListenError, PacketSource};
 
 const RECV_BUF_SIZE: usize = 2048;
+
+// The typed errno is diagnostic-only (nothing branches on it), so it's logged here and erased to the
+// payload-free marker (ADR-0003).
+fn io_err(e: Errno) -> ListenError {
+    dbgprintln!("io error: {e:?}");
+    ListenError::Io
+}
 
 // tcpdump -dd "inbound and udp and src host 1.2.3.4"
 //
@@ -86,8 +94,8 @@ impl PacketSource for Source {
     const MAX_FRAME: usize = RECV_BUF_SIZE;
 
     fn open(_iface: Option<&str>) -> Result<Self, ListenError> {
-        let eth_p_all_be = NonZeroU32::new((libc::ETH_P_ALL as u16).to_be() as u32)
-            .ok_or(ListenError::Io(Errno::INVAL))?;
+        let eth_p_all_be =
+            NonZeroU32::new((libc::ETH_P_ALL as u16).to_be() as u32).ok_or(ListenError::Io)?;
         // Blocking socket: the threaded runtime dedicates a thread to recv, so
         // a blocking read is what we want (an async runtime would set NONBLOCK).
         let fd = socket_with(
@@ -96,7 +104,7 @@ impl PacketSource for Source {
             SocketFlags::CLOEXEC,
             Some(Protocol::from_raw(eth_p_all_be)),
         )
-        .map_err(ListenError::Io)?;
+        .map_err(io_err)?;
 
         // NOTE: Intentionally don't bind so we can listen on all interfaces.
 
@@ -123,7 +131,7 @@ impl PacketSource for Source {
         };
 
         if rc < 0 {
-            return Err(ListenError::Io(Errno::from_raw_os_error(unsafe {
+            return Err(io_err(Errno::from_raw_os_error(unsafe {
                 *libc::__errno_location()
             })));
         }
@@ -138,7 +146,7 @@ impl PacketSource for Source {
             match rustix::net::recv(&self.fd, &mut self.buf[..], RecvFlags::empty()) {
                 Ok((n, _)) => return Ok(&self.buf[..n]),
                 Err(Errno::INTR) => continue,
-                Err(e) => return Err(ListenError::Io(e)),
+                Err(e) => return Err(io_err(e)),
             }
         }
     }

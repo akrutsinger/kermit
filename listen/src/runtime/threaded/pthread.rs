@@ -11,7 +11,6 @@ use core::ffi::c_void;
 use core::mem::MaybeUninit;
 
 use common::dbgprintln;
-use rustix::io::Errno;
 
 use crate::source::{ListenError, PacketSource};
 
@@ -152,7 +151,8 @@ fn spawn_detached<F: FnOnce() + Send + 'static>(f: F) -> Result<(), ListenError>
     if rc != 0 {
         // Thread never started; reclaim the closure we leaked into `arg`.
         unsafe { drop(Box::from_raw(arg as *mut Box<dyn FnOnce() + Send>)) };
-        return Err(ListenError::Io(Errno::from_raw_os_error(rc)));
+        dbgprintln!("pthread_create failed: {rc}");
+        return Err(ListenError::Io);
     }
     unsafe { libc::pthread_detach(handle) };
     Ok(())

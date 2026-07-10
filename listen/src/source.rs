@@ -1,7 +1,7 @@
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum ListenError {
-    Io(rustix::io::Errno),
+    Io,
     NoIface,
     NoBpfDevice,
     IfaceNameTooLong,
@@ -12,7 +12,7 @@ impl core::fmt::Display for ListenError {
     fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         #[cfg(debug_assertions)]
         match self {
-            ListenError::Io(errno) => write!(_f, "i/o error: {errno:?}")?,
+            ListenError::Io => _f.write_str("i/o error")?,
             ListenError::NoIface => _f.write_str("interface name required")?,
             ListenError::NoBpfDevice => _f.write_str("no available /dev/bpf* device")?,
             ListenError::IfaceNameTooLong => _f.write_str("interface name too long")?,
