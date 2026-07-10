@@ -25,6 +25,11 @@
 //! check_and_record_nonce(&nonce, base_key)?;       // reject replays, gated behind open()
 //! ```
 //!
+//! Callers that cannot allocate (embedded) use [`StreamAead::seal_into`] and
+//! [`StreamAead::open_into`], which write into caller-owned buffers instead of returning `Vec`s;
+//! [`StreamAead::OVERHEAD`] sizes them. The `Vec`-returning [`Protocol`] methods above are thin
+//! wrappers over that core.
+//!
 //! # Why it is shaped this way
 //!
 //! * Authentication needs a secret key. An unkeyed hash over the ciphertext catches accidental
@@ -78,6 +83,7 @@ const CHACHA20_NONCE_LEN: usize = 12;
 #[derive(Debug, PartialEq)]
 pub enum ProtoError {
     TooShort,
+    BufferTooSmall,
     Mac,
     NoncePresent,
     Io,
@@ -89,6 +95,7 @@ impl core::fmt::Display for ProtoError {
         #[cfg(debug_assertions)]
         match self {
             ProtoError::TooShort => _f.write_str("input too short")?,
+            ProtoError::BufferTooSmall => _f.write_str("output buffer too small")?,
             ProtoError::Mac => _f.write_str("mac verification failed")?,
             ProtoError::NoncePresent => _f.write_str("nonce already present (replay detected)")?,
             ProtoError::Io => _f.write_str("i/o error")?,
@@ -130,14 +137,17 @@ pub fn derive_mac_key(base_key: &[u8]) -> Result<[u8; 32], ProtoError> {
     derive_key(base_key, b"seal:mac-key:v1")
 }
 
-/// HMAC-SHA256 over the concatenation of `parts`, truncated to the leftmost `n` bytes. Taking the
-/// parts as a slice lets callers MAC `nonce ‖ ct` without allocating a joined buffer.
-fn compute_tag(mac_key: &[u8], parts: &[&[u8]], n: usize) -> Result<Vec<u8>, ProtoError> {
+/// HMAC-SHA256 over the concatenation of `parts`, writing the leftmost `out.len()` bytes of the tag
+/// into `out`. Taking the parts as a slice lets callers MAC `nonce ‖ ct` without a joined buffer,
+/// and writing into `out` keeps it allocation-free. `out.len()` must be `<= 32` (the digest width).
+fn compute_tag_into(mac_key: &[u8], parts: &[&[u8]], out: &mut [u8]) -> Result<(), ProtoError> {
     let mut m = Hmac::<Sha256>::new_from_slice(mac_key).map_err(|_| ProtoError::Init)?;
     for part in parts {
         m.update(part);
     }
-    Ok(m.finalize().into_bytes()[..n].to_vec())
+    let full = m.finalize().into_bytes();
+    out.copy_from_slice(&full[..out.len()]);
+    Ok(())
 }
 
 /// Constant-time verify of a left-truncated HMAC-SHA256 tag over the concatenation of `parts`.
@@ -149,12 +159,17 @@ fn verify_tag(mac_key: &[u8], parts: &[&[u8]], tag: &[u8]) -> Result<(), ProtoEr
     m.verify_truncated_left(tag).map_err(|_| ProtoError::Mac)
 }
 
-/// Zero-pad `short` up to the cipher's full nonce width. Entropy stays at `short.len()` bytes,
-/// which keeps the wire cost small at the cost of birthday-bounded nonce collisions.
-fn expand_short_nonce(len: usize, short: &[u8]) -> Vec<u8> {
-    let mut n = vec![0u8; len];
-    n[..short.len()].copy_from_slice(short);
-    n
+/// Widest stream-cipher IV the stack-buffer paths size for (XChaCha20 is 24; ChaCha20 is 12).
+/// `StreamAead::new` rejects any cipher whose `iv_size()` exceeds this.
+const MAX_IV_LEN: usize = 24;
+
+/// Zero-pad `short` into a stack buffer wide enough for any supported cipher's IV; callers slice it
+/// to the cipher's actual `iv_size()`. Entropy stays at `short.len()` bytes, the rest zero, which
+/// keeps the wire cost small at the cost of birthday-bounded nonce collisions.
+fn stack_iv(short: &[u8]) -> [u8; MAX_IV_LEN] {
+    let mut iv = [0u8; MAX_IV_LEN];
+    iv[..short.len()].copy_from_slice(short);
+    iv
 }
 
 /// XOR `buf` in place with the keystream from cipher `S`. Used where a heap allocation for a new
@@ -306,11 +321,15 @@ pub struct StreamAead<S, const NONCE_LEN: usize, const TAG_LEN: usize> {
 impl<S: KeyIvInit + StreamCipher, const NONCE_LEN: usize, const TAG_LEN: usize>
     StreamAead<S, NONCE_LEN, TAG_LEN>
 {
+    /// Wire overhead added to every message: the `nonce ‖ tag` prefix. A sealed message is
+    /// `OVERHEAD + msg.len()` bytes; size the output of [`seal_into`](Self::seal_into) with it.
+    pub const OVERHEAD: usize = NONCE_LEN + TAG_LEN;
+
     pub fn new(base_key: &[u8]) -> Result<Self, ProtoError> {
         // TAG_LEN is the truncated-HMAC width; HMAC-SHA256 yields 32 bytes, so a larger TAG_LEN
-        // would slice past the digest and panic in `compute_tag`. NONCE_LEN must be non-empty. Both
-        // are wrapped in `const` so an out-of-range value is a compile-time error rather than a
-        // runtime panic.
+        // would slice past the digest and panic in `compute_tag_into`. NONCE_LEN must be non-empty.
+        // Both are wrapped in `const` so an out-of-range value is a compile-time error rather than
+        // a runtime panic.
         const {
             assert!(
                 TAG_LEN >= 1 && TAG_LEN <= 32,
@@ -319,10 +338,11 @@ impl<S: KeyIvInit + StreamCipher, const NONCE_LEN: usize, const TAG_LEN: usize>
         };
         const { assert!(NONCE_LEN >= 1, "StreamAead NONCE_LEN must be >= 1") };
 
-        // The nonce is zero-padded up to the cipher's IV width, so it cannot be wider than that; a
-        // wider NONCE_LEN would overflow the pad buffer in `expand_short_nonce`. `iv_size` is not
-        // const-evaluable, so this is a runtime check.
-        if NONCE_LEN > S::iv_size() {
+        // The nonce is zero-padded up to the cipher's IV width in a MAX_IV_LEN stack buffer, so the
+        // nonce can be no wider than the IV width and the IV width no wider than MAX_IV_LEN.
+        // `iv_size` is not const-evaluable, so these are runtime checks.
+        let iv_size = S::iv_size();
+        if iv_size > MAX_IV_LEN || NONCE_LEN > iv_size {
             return Err(ProtoError::Init);
         }
 
@@ -333,20 +353,79 @@ impl<S: KeyIvInit + StreamCipher, const NONCE_LEN: usize, const TAG_LEN: usize>
         })
     }
 
-    /// Core of `seal` with the nonce supplied by the caller. `seal` wraps this with a fresh random
-    /// nonce; tests use it directly to pin a deterministic wire vector.
-    fn seal_with_nonce(&self, nonce: [u8; NONCE_LEN], msg: &[u8]) -> Result<Vec<u8>, ProtoError> {
-        let iv = expand_short_nonce(S::iv_size(), &nonce);
-        let mut ct = msg.to_vec();
-        S::new_from_slices(&self.enc_key, &iv)
+    /// Draw a fresh nonce and seal `msg` into `out` as `nonce ‖ tag ‖ ciphertext`, returning the
+    /// total byte length written. Allocation-free counterpart to [`Protocol::seal`]: `out` must
+    /// hold at least `OVERHEAD + msg.len()` bytes or this returns [`ProtoError::BufferTooSmall`].
+    pub fn seal_into(&self, msg: &[u8], out: &mut [u8]) -> Result<usize, ProtoError> {
+        let mut nonce = [0u8; NONCE_LEN];
+        fill(&mut nonce).map_err(|_| ProtoError::Init)?;
+        self.seal_into_with_nonce(nonce, msg, out)
+    }
+
+    /// Core of `seal_into` with the nonce supplied by the caller. Tests use it directly to pin a
+    /// deterministic wire vector.
+    fn seal_into_with_nonce(
+        &self,
+        nonce: [u8; NONCE_LEN],
+        msg: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, ProtoError> {
+        let total = Self::OVERHEAD + msg.len();
+        if out.len() < total {
+            return Err(ProtoError::BufferTooSmall);
+        }
+
+        let (nonce_out, rest) = out[..total].split_at_mut(NONCE_LEN);
+        let (tag_out, ct_out) = rest.split_at_mut(TAG_LEN);
+
+        nonce_out.copy_from_slice(&nonce);
+        ct_out.copy_from_slice(msg);
+        let iv = stack_iv(&nonce);
+        S::new_from_slices(&self.enc_key, &iv[..S::iv_size()])
             .map_err(|_| ProtoError::Init)?
-            .apply_keystream(&mut ct);
+            .apply_keystream(ct_out);
+
         // Encrypt-then-MAC: authenticate the nonce and the ciphertext.
-        let tag = compute_tag(&self.mac_key, &[&nonce, &ct], TAG_LEN)?;
-        let mut wire = Vec::with_capacity(NONCE_LEN + TAG_LEN + ct.len());
-        wire.extend_from_slice(&nonce);
-        wire.extend_from_slice(&tag);
-        wire.extend_from_slice(&ct);
+        compute_tag_into(&self.mac_key, &[&*nonce_out, &*ct_out], tag_out)?;
+        Ok(total)
+    }
+
+    /// Verify and decrypt `wire`, writing the plaintext into `out`. Returns the nonce (borrowed
+    /// from `wire`, for replay detection) and the plaintext length. Allocation-free counterpart to
+    /// [`Protocol::open`]: `out` must hold at least `wire.len() - OVERHEAD` bytes.
+    pub fn open_into<'w>(
+        &self,
+        wire: &'w [u8],
+        out: &mut [u8],
+    ) -> Result<(&'w [u8], usize), ProtoError> {
+        if wire.len() < Self::OVERHEAD {
+            return Err(ProtoError::TooShort);
+        }
+        let nonce = &wire[..NONCE_LEN];
+        let tag = &wire[NONCE_LEN..Self::OVERHEAD];
+        let ct = &wire[Self::OVERHEAD..];
+        if out.len() < ct.len() {
+            return Err(ProtoError::BufferTooSmall);
+        }
+
+        // Encrypt-then-MAC: verify before touching the cipher, so a forgery never reaches decrypt.
+        verify_tag(&self.mac_key, &[nonce, ct], tag)?;
+
+        let pt = &mut out[..ct.len()];
+        pt.copy_from_slice(ct);
+        let iv = stack_iv(nonce);
+        S::new_from_slices(&self.enc_key, &iv[..S::iv_size()])
+            .map_err(|_| ProtoError::Init)?
+            .apply_keystream(pt);
+        Ok((nonce, ct.len()))
+    }
+
+    /// Allocating `seal` with the nonce supplied by the caller, used only by tests to pin a
+    /// deterministic wire vector.
+    #[cfg(test)]
+    fn seal_with_nonce(&self, nonce: [u8; NONCE_LEN], msg: &[u8]) -> Result<Vec<u8>, ProtoError> {
+        let mut wire = vec![0u8; Self::OVERHEAD + msg.len()];
+        self.seal_into_with_nonce(nonce, msg, &mut wire)?;
         Ok(wire)
     }
 }
@@ -355,27 +434,17 @@ impl<S: KeyIvInit + StreamCipher, const NONCE_LEN: usize, const TAG_LEN: usize> 
     for StreamAead<S, NONCE_LEN, TAG_LEN>
 {
     fn seal(&self, msg: &[u8]) -> Result<Vec<u8>, ProtoError> {
-        let mut nonce = [0u8; NONCE_LEN];
-        fill(&mut nonce).map_err(|_| ProtoError::Init)?;
-        self.seal_with_nonce(nonce, msg)
+        let mut wire = vec![0u8; Self::OVERHEAD + msg.len()];
+        self.seal_into(msg, &mut wire)?;
+        Ok(wire)
     }
 
     fn open(&self, wire: &[u8]) -> Result<(Vec<u8>, Vec<u8>), ProtoError> {
-        if wire.len() < NONCE_LEN + TAG_LEN {
+        if wire.len() < Self::OVERHEAD {
             return Err(ProtoError::TooShort);
         }
-        let nonce = &wire[..NONCE_LEN];
-        let tag = &wire[NONCE_LEN..NONCE_LEN + TAG_LEN];
-        let ct = &wire[NONCE_LEN + TAG_LEN..];
-
-        // Encrypt-then-MAC: verify before touching the cipher, so a forgery never reaches decrypt.
-        verify_tag(&self.mac_key, &[nonce, ct], tag)?;
-
-        let iv = expand_short_nonce(S::iv_size(), nonce);
-        let mut pt = ct.to_vec();
-        S::new_from_slices(&self.enc_key, &iv)
-            .map_err(|_| ProtoError::Init)?
-            .apply_keystream(&mut pt);
+        let mut pt = vec![0u8; wire.len() - Self::OVERHEAD];
+        let (nonce, _) = self.open_into(wire, &mut pt)?;
         Ok((nonce.to_vec(), pt))
     }
 }
@@ -402,6 +471,34 @@ mod tests {
         let (nonce, pt) = p.open(&wire).unwrap();
         assert_eq!(nonce.len(), NONCE_LEN);
         assert_eq!(pt, MSG);
+    }
+
+    #[test]
+    fn into_round_trip() {
+        // The allocation-free path over caller-owned buffers round-trips, and the nonce it returns
+        // is the wire prefix the replay check needs.
+        type P = StreamAead<ChaCha20, NONCE_LEN, TAG_LEN>;
+        let p = proto();
+
+        let mut wire = [0u8; P::OVERHEAD + MSG.len()];
+        let n = p.seal_into(MSG, &mut wire).unwrap();
+        assert_eq!(n, wire.len());
+
+        let mut pt = [0u8; MSG.len()];
+        let (nonce, len) = p.open_into(&wire, &mut pt).unwrap();
+        assert_eq!(nonce, &wire[..NONCE_LEN]);
+        assert_eq!(&pt[..len], MSG);
+    }
+
+    #[test]
+    fn seal_into_rejects_small_buffer() {
+        type P = StreamAead<ChaCha20, NONCE_LEN, TAG_LEN>;
+        let p = proto();
+        let mut too_small = [0u8; P::OVERHEAD + MSG.len() - 1];
+        assert_eq!(
+            p.seal_into(MSG, &mut too_small),
+            Err(ProtoError::BufferTooSmall)
+        );
     }
 
     #[test]
