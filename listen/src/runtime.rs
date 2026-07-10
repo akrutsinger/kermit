@@ -1,21 +1,13 @@
-//! Concurrency runtime, selected at compile time and orthogonal to the OS axis in `os`. Exactly one
-//! runtime feature must be enabled:
+//! Concurrency runtime, selected at compile time and orthogonal to the OS axis in `os`.
 //!
-//!   runtime-threads: one OS thread per packet, capped by the caller; the
-//!                    hosted default.
-//!   runtime-embassy: embassy async executor for embedded (future; the module
-//!                    is preserved as a seam and not built by default).
+//! `runtime-threads` (one OS thread per packet, capped by the caller) is the only runtime today.
+//! The embedded async runtime was removed until a concrete target is chosen (ADR-0007); rebuilding
+//! it reintroduces a second arm on this axis.
 
-#[cfg(not(any(feature = "runtime-threads", feature = "runtime-embassy")))]
-compile_error!("listen: enable exactly one runtime feature: runtime-threads | runtime-embassy");
-
-#[cfg(all(feature = "runtime-threads", feature = "runtime-embassy"))]
-compile_error!("listen: runtime features are mutually exclusive; enable only one");
+#[cfg(not(feature = "runtime-threads"))]
+compile_error!("listen: enable the runtime-threads feature");
 
 #[cfg(feature = "runtime-threads")]
 mod threaded;
 #[cfg(feature = "runtime-threads")]
 pub use threaded::run;
-
-#[cfg(feature = "runtime-embassy")]
-mod embassy;

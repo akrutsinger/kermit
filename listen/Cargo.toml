@@ -11,16 +11,9 @@ freebsd = []
 openbsd = []
 windows = []
 
-# Concurrency runtime (mutually exclusive; enforced in src/runtime.rs).
-# runtime-threads: OS thread pool (pthreads) for hosted builds.
-# runtime-embassy: embassy async executor for embedded (future; seam only).
+# Concurrency runtime. runtime-threads (thread-per-packet, hosted) is the only runtime today;
+# the embedded async runtime was removed until a target is chosen (ADR-0007).
 runtime-threads = []
-runtime-embassy = [
-    "dep:embassy-executor",
-    "dep:embassy-sync",
-    "dep:critical-section",
-    "dep:static_cell",
-]
 
 [dependencies]
 # Internal
@@ -32,9 +25,3 @@ chacha20.workspace = true
 libc.workspace = true
 getrandom.workspace = true
 rustix.workspace = true
-
-# runtime-embassy only
-critical-section = { workspace = true, optional = true }
-embassy-executor = { workspace = true, features = ["executor-thread"], optional = true }
-embassy-sync = { workspace = true, optional = true }
-static_cell = { workspace = true, optional = true }

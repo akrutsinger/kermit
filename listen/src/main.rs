@@ -19,13 +19,6 @@ use getrandom::fill;
 #[cfg(not(test))]
 use source::PacketSource as _;
 
-// The embassy runtime is preserved as a seam (see runtime/embassy.rs) but is not yet wired into
-// `main`; fail loudly rather than with a confusing error.
-#[cfg(all(not(test), feature = "runtime-embassy"))]
-compile_error!(
-    "listen: runtime-embassy is a future seam, not yet wired into main; build with runtime-threads"
-);
-
 #[cfg(not(test))]
 struct LibcAlloc;
 
@@ -51,8 +44,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     unsafe { libc::abort() }
 }
 
-// The precompiled liballoc rlib is built with panic=unwind and references this symbol.
-// Provide a stub so the linker is satisfied; it is never called because panic=abort.
+// The precompiled liballoc rlib is built with panic=unwind and references this symbol. Provide a
+// stub so the linker is satisfied; it is never called because panic=abort.
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
 extern "C" fn rust_eh_personality() {}

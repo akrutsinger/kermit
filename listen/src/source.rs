@@ -44,6 +44,6 @@ pub trait PacketSource: Send + Sized {
     // Blocks until the next matching packet arrives. The returned slice borrows from the source's
     // internal buffer and is valid until the next call to `recv`. The threaded runtime calls this
     // from a dedicated recv thread; an async runtime would instead use a non-blocking socket +
-    // readiness (see the embassy seam).
+    // readiness.
     fn recv(&mut self) -> Result<&[u8], ListenError>;
 }
