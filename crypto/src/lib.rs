@@ -63,6 +63,7 @@ use cipher::{KeyIvInit, StreamCipher};
 use getrandom::fill;
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
+#[cfg(all(not(test), not(windows)))]
 use rustix::fs::{FlockOperation, Mode, OFlags, SeekFrom, flock};
 use sha2::Sha256;
 
@@ -169,10 +170,9 @@ fn stream_xor_in_place<S: KeyIvInit + StreamCipher>(
     Ok(())
 }
 
-/// Check the `/tmp/nonce` ring buffer for `nonce`; return `Err(NoncePresent)` if found, otherwise
-/// record it and return `Ok(())`. The slot size follows `nonce.len()`, so the same length must be
-/// used for the lifetime of the on-disk file (it is fixed by the `StreamAead` `NONCE_LEN`
-/// parameter).
+/// Check the nonce ring for `nonce`; return `Err(NoncePresent)` if found, otherwise record it and
+/// return `Ok(())`. The slot size follows `nonce.len()`, so the same length must be used for the
+/// lifetime of a given `base_key`'s ring (it is fixed by the `StreamAead` `NONCE_LEN` parameter).
 ///
 /// On-disk layout: `1 + NONCE_WINDOW * nonce.len()` bytes of ChaCha20-encrypted ring buffer. Fixed
 /// zero IV is safe because the derived key is unique per session. Plaintext layout: `[head:
@@ -183,6 +183,46 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
     let file_key = derive_key(base_key, b"nonce-file:key:v1")?;
     let iv = [0u8; CHACHA20_NONCE_LEN];
 
+    with_locked_ring(base_key, file_len, |ring, had_prior_content| {
+        if had_prior_content {
+            stream_xor_in_place::<ChaCha20>(&file_key, &iv, ring)?;
+        }
+
+        let head = (ring[0] as usize) % NONCE_WINDOW;
+
+        for i in 0..NONCE_WINDOW {
+            if &ring[1 + i * n..1 + (i + 1) * n] == nonce {
+                return Err(ProtoError::NoncePresent);
+            }
+        }
+
+        ring[1 + head * n..1 + (head + 1) * n].copy_from_slice(nonce);
+        ring[0] = ((head + 1) % NONCE_WINDOW) as u8;
+
+        stream_xor_in_place::<ChaCha20>(&file_key, &iv, ring)
+    })
+}
+
+/// Give `f` exclusive, locked access to the on-disk (or in-memory, in tests) nonce ring scoped to
+/// `base_key`, zero-filled to `len` bytes. Handles locking and persistence only -- no crypto
+/// happens here, `check_and_record_nonce` owns that. `had_prior_content` is `false` the first time
+/// this `base_key`'s ring is touched (nothing to decrypt yet), `true` once something has actually
+/// been written.
+///
+/// The replay window is a read-modify-write on shared state with no serialization of its own. Under
+/// the multi-threaded handler pool (and, for the hosted backend, across concurrent processes) two
+/// callers could otherwise both read the ring, both miss a nonce, and both record it, leaving a
+/// hole in the replay window. Locking serializes the whole critical section, and the result is only
+/// persisted on `Ok` -- a rejected replay (`Err`) leaves the stored ring untouched.
+// `rustix::fs` (open/flock/read/write/seek) has no Windows backend at all -- rustix's Windows
+// support covers `net` only -- so this hosted body only ever applies to the Linux/BSD targets that
+// actually have it.
+#[cfg(all(not(test), not(windows)))]
+fn with_locked_ring<T>(
+    _base_key: &[u8],
+    len: usize,
+    f: impl FnOnce(&mut Vec<u8>, bool) -> Result<T, ProtoError>,
+) -> Result<T, ProtoError> {
     let fd = rustix::fs::open(
         c"/tmp/nonce",
         OFlags::RDWR | OFlags::CREATE,
@@ -193,34 +233,52 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
         ProtoError::Io(e)
     })?;
 
-    // The replay window is a read-modify-write on a shared file with no serialization of its own.
-    // Under the multi-threaded handler pool (and across concurrent processes) two callers could
-    // otherwise both read the ring, both miss a nonce, and both record it, leaving a hole in the
-    // replay window. LOCK_EX serializes the whole critical section; the lock releases when `fd` is
-    // dropped at the end of this function.
+    // LOCK_EX serializes the whole critical section; the lock releases when `fd` is dropped at the
+    // end of this function.
     flock(&fd, FlockOperation::LockExclusive).map_err(ProtoError::Io)?;
 
-    let mut ring = vec![0u8; file_len];
-    if rustix::io::read(&fd, &mut ring[..]).map_err(ProtoError::Io)? == file_len {
-        stream_xor_in_place::<ChaCha20>(&file_key, &iv, &mut ring)?;
-    }
+    let mut ring = vec![0u8; len];
+    let had_prior_content = rustix::io::read(&fd, &mut ring[..]).map_err(ProtoError::Io)? == len;
 
-    let head = (ring[0] as usize) % NONCE_WINDOW;
-
-    for i in 0..NONCE_WINDOW {
-        if &ring[1 + i * n..1 + (i + 1) * n] == nonce {
-            return Err(ProtoError::NoncePresent);
-        }
-    }
-
-    ring[1 + head * n..1 + (head + 1) * n].copy_from_slice(nonce);
-    ring[0] = ((head + 1) % NONCE_WINDOW) as u8;
-
-    stream_xor_in_place::<ChaCha20>(&file_key, &iv, &mut ring)?;
+    let result = f(&mut ring, had_prior_content)?;
 
     rustix::fs::seek(&fd, SeekFrom::Start(0)).map_err(ProtoError::Io)?;
     rustix::io::write(&fd, &ring).map_err(ProtoError::Io)?;
-    Ok(())
+    Ok(result)
+}
+
+// No Windows nonce-store backend exists yet (it would need direct `windows-sys` file locking, e.g.
+// `CreateFileW` + `LockFileEx` and rustix has no `fs` backend on Windows to fall back to). Fail
+// loudly at compile time rather than deep inside `rustix` with a confusing "module not found".
+#[cfg(all(not(test), windows))]
+compile_error!("crypto: windows nonce-store backend not implemented yet.");
+
+/// Test backend: an in-memory ring per `base_key`, so tests never touch a real file and distinct
+/// keys never see each other's replay history (which is also what lets these tests run in parallel
+/// with each other, same as any other `cargo test` invocation).
+#[cfg(test)]
+fn with_locked_ring<T>(
+    base_key: &[u8],
+    len: usize,
+    f: impl FnOnce(&mut Vec<u8>, bool) -> Result<T, ProtoError>,
+) -> Result<T, ProtoError> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    static RINGS: LazyLock<Mutex<HashMap<Vec<u8>, Vec<u8>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    let mut rings = RINGS.lock().unwrap();
+    let had_prior_content = rings.contains_key(base_key);
+    let mut ring = rings
+        .get(base_key)
+        .cloned()
+        .unwrap_or_else(|| vec![0u8; len]);
+
+    let result = f(&mut ring, had_prior_content)?;
+
+    rings.insert(base_key.to_vec(), ring);
+    Ok(result)
 }
 
 /// Stateless authenticated-encryption envelope: encrypt-then-MAC with an explicit random nonce.
@@ -462,6 +520,46 @@ mod tests {
     fn four_byte_tag_chosen_plaintext_forgery() {
         let tries = forge_chosen_plaintext::<8, 4>();
         dbgprintln!("TAG_LEN=4 chosen-plaintext forgery succeeded after {tries} tries");
+    }
+
+    #[test]
+    fn replay_check_accepts_first_seen_nonce() {
+        let key = b"replay-test-key-first-seen-0000";
+        assert!(check_and_record_nonce(&[1u8; 8], key).is_ok());
+    }
+
+    #[test]
+    fn replay_check_rejects_immediate_replay() {
+        let key = b"replay-test-key-immediate-00000";
+        let nonce = [2u8; 8];
+        assert!(check_and_record_nonce(&nonce, key).is_ok());
+        assert_eq!(
+            check_and_record_nonce(&nonce, key),
+            Err(ProtoError::NoncePresent)
+        );
+    }
+
+    #[test]
+    fn replay_check_wraps_and_evicts_oldest() {
+        let key = b"replay-test-key-wraparound-0000";
+        // Start at 1: an all-zero nonce would be indistinguishable from a fresh, never-written ring
+        // slot (both are all-zero bytes), which isn't what this test means to exercise.
+        let nonces: Vec<[u8; 8]> = (1..=NONCE_WINDOW + 1).map(|i| [i as u8; 8]).collect();
+        for nonce in &nonces {
+            assert!(check_and_record_nonce(nonce, key).is_ok());
+        }
+        // NONCE_WINDOW + 1 distinct nonces have been recorded, so the first one has been evicted by
+        // wraparound; it's accepted again instead of rejected as a replay.
+        assert!(check_and_record_nonce(&nonces[0], key).is_ok());
+    }
+
+    #[test]
+    fn replay_check_isolates_by_base_key() {
+        let nonce = [9u8; 8];
+        let key_a = b"replay-test-key-isolation-key-a0";
+        let key_b = b"replay-test-key-isolation-key-b0";
+        assert!(check_and_record_nonce(&nonce, key_a).is_ok());
+        assert!(check_and_record_nonce(&nonce, key_b).is_ok());
     }
 
     #[test]

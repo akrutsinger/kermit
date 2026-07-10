@@ -273,6 +273,65 @@ mod tests {
     // are still in flight when released, so `max_in_flight` reaches 2. A serial
     // pool runs them back to back: the first leaves (in_flight back to 0)
     // before the second arrives, so the high-water mark stays at 1.
+    fn frame_with(byte: u8) -> Frame {
+        let mut f = Frame::EMPTY;
+        f.buf[0] = byte;
+        f.len = 1;
+        f
+    }
+
+    #[test]
+    fn push_then_pop_returns_fifo_order() {
+        let q = Queue::new();
+        assert!(q.push(frame_with(1)));
+        assert!(q.push(frame_with(2)));
+
+        let first = q.pop().unwrap();
+        let second = q.pop().unwrap();
+        assert_eq!(first.buf[0], 1);
+        assert_eq!(second.buf[0], 2);
+    }
+
+    #[test]
+    fn full_queue_drops_new_frame() {
+        let q = Queue::new();
+        for i in 0..QUEUE_DEPTH {
+            assert!(q.push(frame_with(i as u8)), "push {i} should have room");
+        }
+
+        // Queue is now at capacity; the next push is backpressure, not eviction.
+        assert!(!q.push(frame_with(0xFF)));
+
+        // The original frames are all still there, in order, undisturbed by the
+        // rejected push.
+        for i in 0..QUEUE_DEPTH {
+            assert_eq!(q.pop().unwrap().buf[0], i as u8);
+        }
+    }
+
+    #[test]
+    fn close_drains_before_pop_returns_none() {
+        let q = Queue::new();
+        assert!(q.push(frame_with(1)));
+        assert!(q.push(frame_with(2)));
+
+        q.close();
+
+        // Already-queued frames are still delivered after close...
+        assert_eq!(q.pop().unwrap().buf[0], 1);
+        assert_eq!(q.pop().unwrap().buf[0], 2);
+        // ...only once drained does pop signal the workers to exit.
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn push_after_close_rejected() {
+        let q = Queue::new();
+        q.close();
+        assert!(!q.push(frame_with(1)));
+        assert!(q.pop().is_none());
+    }
+
     #[test]
     fn handlers_run_concurrently() {
         let gate = Arc::new((Mutex::new(Gate::default()), Condvar::new()));
