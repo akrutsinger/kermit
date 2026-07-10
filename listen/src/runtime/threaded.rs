@@ -46,6 +46,16 @@ where
     S: PacketSource,
     H: Fn(&[u8]) + Send + Sync + 'static,
 {
+    // `S::MAX_FRAME` is only the size a *source* declares at compile time; a backend whose real
+    // max is discovered at runtime (e.g. BSD's `BIOCGBLEN`) can't be checked here -- see the
+    // truncation log in the recv loop below for that case.
+    const {
+        assert!(
+            S::MAX_FRAME <= FRAME_LEN,
+            "PacketSource::MAX_FRAME exceeds the runtime's fixed FRAME_LEN"
+        )
+    };
+
     let queue = Arc::new(Queue::new());
     let handler = Arc::new(handler);
 
@@ -73,6 +83,13 @@ where
     let result = loop {
         match src.recv() {
             Ok(pkt) => {
+                if pkt.len() > FRAME_LEN {
+                    dbgprintln!(
+                        "listen: packet len {} exceeds FRAME_LEN {}, truncating",
+                        pkt.len(),
+                        FRAME_LEN
+                    );
+                }
                 let len = pkt.len().min(FRAME_LEN);
                 let mut frame = Frame::EMPTY;
                 frame.buf[..len].copy_from_slice(&pkt[..len]);
@@ -242,6 +259,7 @@ mod tests {
 
     impl PacketSource for FakeSource {
         type Filter = ();
+        const MAX_FRAME: usize = 4;
 
         fn open(_iface: Option<&str>) -> Result<Self, ListenError> {
             unreachable!("tests construct FakeSource directly")

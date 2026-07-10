@@ -83,6 +83,7 @@ pub struct Source {
 
 impl PacketSource for Source {
     type Filter = [SockFilter];
+    const MAX_FRAME: usize = RECV_BUF_SIZE;
 
     fn open(_iface: Option<&str>) -> Result<Self, ListenError> {
         let eth_p_all_be = NonZeroU32::new((libc::ETH_P_ALL as u16).to_be() as u32)
