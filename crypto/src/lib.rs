@@ -198,9 +198,14 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
     let file_key = derive_key(base_key, b"nonce-file:key:v1")?;
     let iv = [0u8; CHACHA20_NONCE_LEN];
 
-    with_locked_ring(base_key, file_len, |ring, had_prior_content| {
-        if had_prior_content {
+    with_locked_ring(|ring| {
+        // A ring of the expected length is prior (encrypted) content to decrypt; anything else (a
+        // new or malformed file) starts from a zero ring.
+        if ring.len() == file_len {
             stream_xor_in_place::<ChaCha20>(&file_key, &iv, ring)?;
+        } else {
+            ring.clear();
+            ring.resize(file_len, 0);
         }
 
         let head = (ring[0] as usize) % NONCE_WINDOW;
@@ -218,11 +223,10 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
     })
 }
 
-/// Give `f` exclusive, locked access to the on-disk (or in-memory, in tests) nonce ring scoped to
-/// `base_key`, zero-filled to `len` bytes. Handles locking and persistence only -- no crypto
-/// happens here, `check_and_record_nonce` owns that. `had_prior_content` is `false` the first time
-/// this `base_key`'s ring is touched (nothing to decrypt yet), `true` once something has actually
-/// been written.
+/// Give `f` exclusive, locked access to the raw nonce-ring bytes: the current file contents (empty
+/// the first time, before anything has been written) go in, and whatever `f` leaves in the buffer is
+/// persisted back. Locking and persistence only -- `f` (`check_and_record_nonce`) owns deciding
+/// whether those bytes are prior content, decrypting them, the replay check, and re-encrypting.
 ///
 /// The replay window is a read-modify-write on shared state with no serialization of its own. Under
 /// the multi-threaded handler pool (and, for the hosted backend, across concurrent processes) two
@@ -234,9 +238,7 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
 // actually have it.
 #[cfg(all(not(test), not(windows)))]
 fn with_locked_ring<T>(
-    _base_key: &[u8],
-    len: usize,
-    f: impl FnOnce(&mut Vec<u8>, bool) -> Result<T, ProtoError>,
+    f: impl FnOnce(&mut Vec<u8>) -> Result<T, ProtoError>,
 ) -> Result<T, ProtoError> {
     // The typed errno is diagnostic-only (nothing branches on it), so it's logged here and erased to
     // the payload-free marker (ADR-0003).
@@ -256,10 +258,17 @@ fn with_locked_ring<T>(
     // end of this function.
     flock(&fd, FlockOperation::LockExclusive).map_err(io_err)?;
 
-    let mut ring = vec![0u8; len];
-    let had_prior_content = rustix::io::read(&fd, &mut ring[..]).map_err(io_err)? == len;
+    let mut ring = Vec::new();
+    let mut chunk = [0u8; 64];
+    loop {
+        let read = rustix::io::read(&fd, &mut chunk).map_err(io_err)?;
+        if read == 0 {
+            break;
+        }
+        ring.extend_from_slice(&chunk[..read]);
+    }
 
-    let result = f(&mut ring, had_prior_content)?;
+    let result = f(&mut ring)?;
 
     rustix::fs::seek(&fd, SeekFrom::Start(0)).map_err(io_err)?;
     rustix::io::write(&fd, &ring).map_err(io_err)?;
@@ -272,32 +281,20 @@ fn with_locked_ring<T>(
 #[cfg(all(not(test), windows))]
 compile_error!("crypto: windows nonce-store backend not implemented yet.");
 
-/// Test backend: an in-memory ring per `base_key`, so tests never touch a real file and distinct
-/// keys never see each other's replay history (which is also what lets these tests run in parallel
-/// with each other, same as any other `cargo test` invocation).
+/// Test backend: a nonce ring per test thread. libtest runs each `#[test]` on its own thread, so
+/// calls within a test share the ring (persisting the encrypted bytes across calls, same as the
+/// file) while separate tests stay isolated, without touching a real file.
 #[cfg(test)]
 fn with_locked_ring<T>(
-    base_key: &[u8],
-    len: usize,
-    f: impl FnOnce(&mut Vec<u8>, bool) -> Result<T, ProtoError>,
+    f: impl FnOnce(&mut Vec<u8>) -> Result<T, ProtoError>,
 ) -> Result<T, ProtoError> {
-    use std::collections::HashMap;
-    use std::sync::{LazyLock, Mutex};
+    use std::cell::RefCell;
 
-    static RINGS: LazyLock<Mutex<HashMap<Vec<u8>, Vec<u8>>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
+    thread_local! {
+        static RING: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
 
-    let mut rings = RINGS.lock().unwrap();
-    let had_prior_content = rings.contains_key(base_key);
-    let mut ring = rings
-        .get(base_key)
-        .cloned()
-        .unwrap_or_else(|| vec![0u8; len]);
-
-    let result = f(&mut ring, had_prior_content)?;
-
-    rings.insert(base_key.to_vec(), ring);
-    Ok(result)
+    RING.with(|cell| f(&mut cell.borrow_mut()))
 }
 
 /// Stateless authenticated-encryption envelope: encrypt-then-MAC with an explicit random nonce.
@@ -652,15 +649,6 @@ mod tests {
         // NONCE_WINDOW + 1 distinct nonces have been recorded, so the first one has been evicted by
         // wraparound; it's accepted again instead of rejected as a replay.
         assert!(check_and_record_nonce(&nonces[0], key).is_ok());
-    }
-
-    #[test]
-    fn replay_check_isolates_by_base_key() {
-        let nonce = [9u8; 8];
-        let key_a = b"replay-test-key-isolation-key-a0";
-        let key_b = b"replay-test-key-isolation-key-b0";
-        assert!(check_and_record_nonce(&nonce, key_a).is_ok());
-        assert!(check_and_record_nonce(&nonce, key_b).is_ok());
     }
 
     #[test]
