@@ -11,3 +11,6 @@ crypto.workspace = true
 # External
 anyhow.workspace = true
 chacha20.workspace = true
+clap.workspace = true
+rustyline.workspace = true
+shlex.workspace = true
