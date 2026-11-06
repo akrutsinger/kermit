@@ -16,6 +16,6 @@ for target in x86_64-unknown-freebsd aarch64-apple-darwin x86_64-pc-windows-gnu;
     cargo clippy -p common -p crypto -p listen --lib --target "$target" --locked -- -D warnings
 done
 
-# Bare metal: the platform layer and crypto only, until listen has a bare-metal backend.
+# Bare metal: every backend is a stub until a board is chosen, but the interfaces still type-check.
 echo "== thumbv7em-none-eabihf"
-cargo clippy -p common -p crypto --target thumbv7em-none-eabihf --locked -- -D warnings
+cargo clippy -p common -p crypto -p listen --lib --target thumbv7em-none-eabihf --locked -- -D warnings

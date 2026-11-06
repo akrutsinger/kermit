@@ -9,7 +9,8 @@
     target_os = "macos",
     target_os = "freebsd",
     target_os = "openbsd",
-    windows
+    windows,
+    target_os = "none"
 )))]
 compile_error!("listen: no OS backend for this target yet");
 
@@ -27,3 +28,8 @@ pub use bsd::{FILTER, Source};
 mod windows;
 #[cfg(windows)]
 pub use windows::{FILTER, Source};
+
+#[cfg(target_os = "none")]
+mod none;
+#[cfg(target_os = "none")]
+pub use none::{FILTER, Source};

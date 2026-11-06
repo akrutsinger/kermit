@@ -1,13 +1,12 @@
-//! Concurrency runtime, selected at compile time and orthogonal to the OS axis in `os`.
-//!
-//! `runtime-threads` (one OS thread per packet, capped by the caller) is the only runtime today.
-//! The embedded async runtime was removed until a concrete target is chosen (ADR-0007); rebuilding
-//! it reintroduces a second arm on this axis.
+//! Concurrency runtime, selected by the compile target (ADR-0010): thread-per-packet on hosted OSes,
+//! and on bare metal an async executor that waits on a concrete board (ADR-0007).
 
-#[cfg(not(feature = "runtime-threads"))]
-compile_error!("listen: enable the runtime-threads feature");
-
-#[cfg(feature = "runtime-threads")]
+#[cfg(any(unix, windows))]
 mod threaded;
-#[cfg(feature = "runtime-threads")]
+#[cfg(any(unix, windows))]
 pub use threaded::run;
+
+#[cfg(target_os = "none")]
+mod bare;
+#[cfg(target_os = "none")]
+pub use bare::run;

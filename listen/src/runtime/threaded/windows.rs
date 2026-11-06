@@ -19,6 +19,6 @@ where
     H: Fn(&[u8]) + Send + Sync + 'static,
 {
     todo!(
-        "windows runtime-threads backend: windows-sys CreateThread + SRWLOCK/CONDITION_VARIABLE gate"
+        "windows thread-per-packet runtime: windows-sys CreateThread + SRWLOCK/CONDITION_VARIABLE gate"
     )
 }

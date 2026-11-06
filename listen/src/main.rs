@@ -37,7 +37,6 @@ mod entry {
 
     /// Per-packet handler, run on its own spawned thread. The burn loop stands in for real processing
     /// so concurrent capture is observable while testing.
-    #[cfg(feature = "runtime-threads")]
     fn handle_packet(pkt: &[u8]) {
         dbgprintln!("matched: {} bytes", pkt.len());
 
@@ -61,12 +60,10 @@ mod entry {
         dbgprintln!("done processing packet");
     }
 
-    #[cfg(feature = "runtime-threads")]
     common::entry!(app_main);
 
     /// OS-agnostic program body; the per-target `common::entry!` shim hands it the first CLI
     /// argument.
-    #[cfg(feature = "runtime-threads")]
     fn app_main(iface: Option<&str>) -> i32 {
         let mut src = match os::Source::open(iface) {
             Ok(src) => src,

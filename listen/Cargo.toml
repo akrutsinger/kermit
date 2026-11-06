@@ -3,13 +3,8 @@ name = "listen"
 version = "0.1.0"
 edition.workspace = true
 
-# The OS backend is chosen by the compile target (`--target`), not by a feature (ADR-0008).
-[features]
-default = ["runtime-threads"]
-
-# Concurrency runtime. runtime-threads (thread-per-packet, hosted) is the only runtime today;
-# the embedded async runtime was removed until a target is chosen (ADR-0007).
-runtime-threads = []
+# The OS backend and the concurrency runtime are both chosen by the compile target (`--target`),
+# not by features (ADR-0008, ADR-0010).
 
 [dependencies]
 # Internal
