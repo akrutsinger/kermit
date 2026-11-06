@@ -8,11 +8,17 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
-use core::mem::MaybeUninit;
 
 use common::dbgprintln;
 
 use crate::source::{ListenError, PacketSource};
+
+#[cfg(feature = "openbsd")]
+use libc::__errno as errno_ptr;
+#[cfg(feature = "linux")]
+use libc::__errno_location as errno_ptr;
+#[cfg(any(feature = "macos", feature = "freebsd"))]
+use libc::__error as errno_ptr;
 
 const FRAME_LEN: usize = 2048;
 
@@ -32,6 +38,7 @@ impl Frame {
 /// Drive the capture loop to completion, spawning at most `max_in_flight` (clamped to >= 1)
 /// concurrent handler threads, one per packet. Returns when `src.recv` reports a fatal error; for a
 /// real socket that is effectively never, so this parks the calling thread for the program's life.
+/// Also errors up front if the OS can't create a semaphore with `max_in_flight` permits.
 pub fn run<S, H>(mut src: S, handler: H, max_in_flight: usize) -> Result<(), ListenError>
 where
     S: PacketSource,
@@ -48,7 +55,7 @@ where
     };
 
     let cap = max_in_flight.max(1);
-    let sem = Arc::new(Semaphore::new(cap as u32));
+    let sem = Semaphore::new(cap)?;
     let handler = Arc::new(handler);
 
     let result = loop {
@@ -89,7 +96,7 @@ where
     // Every spawned handler releases its permit on exit; reacquiring all `cap` of them blocks until
     // the last straggler has finished, so shutdown doesn't race running handlers.
     for _ in 0..cap {
-        sem.acquire();
+        sem.acquire()?;
     }
     result
 }
@@ -98,6 +105,10 @@ where
 /// `sem_post`), used here to cap in-flight handler threads: `new(cap)` starts with `cap` permits,
 /// `try_acquire` takes one without blocking (fails if none are left), `release` returns one, and
 /// `acquire` blocks until one is available.
+///
+/// Only ever lives inside the `Arc` that `new` initializes it in, and is never moved out: POSIX
+/// leaves using a *copy* of a `sem_t` undefined, so the semaphore must stay where `sem_init` put it.
+#[repr(transparent)]
 struct Semaphore(UnsafeCell<libc::sem_t>);
 
 // SAFETY: a process-private (`pshared = 0`) `sem_t` has no thread affinity: any thread of this
@@ -108,13 +119,32 @@ unsafe impl Send for Semaphore {}
 unsafe impl Sync for Semaphore {}
 
 impl Semaphore {
-    fn new(permits: u32) -> Self {
-        let mut sem = MaybeUninit::<libc::sem_t>::uninit();
+    /// Create a semaphore holding `permits` permits, initialized in place in its final `Arc`.
+    /// Errors if `permits` exceeds what the OS allows (`SEM_VALUE_MAX`) or the OS has no unnamed
+    /// semaphores (macOS).
+    fn new(permits: usize) -> Result<Arc<Self>, ListenError> {
+        let Ok(permits) = libc::c_uint::try_from(permits) else {
+            dbgprintln!("semaphore permits {permits} exceed c_uint");
+            return Err(ListenError::Io);
+        };
+
+        let mut sem = Arc::<Self>::new_uninit();
+        let Some(slot) = Arc::get_mut(&mut sem) else {
+            unreachable!("a freshly allocated Arc has no other references");
+        };
+        // `#[repr(transparent)]` over `UnsafeCell<sem_t>`, which itself has the layout of `sem_t`.
+        let raw = slot.as_mut_ptr().cast::<libc::sem_t>();
+
         // pshared = 0: shared between threads of this process, not across processes.
-        // SAFETY: `sem.as_mut_ptr()` points to writable, properly aligned storage for a `sem_t`,
-        // which `sem_init` initializes in place.
-        unsafe { libc::sem_init(sem.as_mut_ptr(), 0, permits) };
-        Semaphore(UnsafeCell::new(unsafe { sem.assume_init() }))
+        // SAFETY: `raw` points to writable, properly aligned storage for a `sem_t` inside the `Arc`
+        // allocation the semaphore will live in for good, which `sem_init` initializes in place.
+        if unsafe { libc::sem_init(raw, 0, permits) } != 0 {
+            dbgprintln!("sem_init failed: errno {}", errno());
+            return Err(ListenError::Io);
+        }
+        // SAFETY: `sem_init` succeeded, so the `sem_t` -- the `Semaphore`'s only field -- is
+        // initialized.
+        Ok(unsafe { sem.assume_init() })
     }
 
     /// Take a permit without blocking. Returns false if none are available.
@@ -124,16 +154,30 @@ impl Semaphore {
         unsafe { libc::sem_trywait(self.0.get()) == 0 }
     }
 
-    /// Block until a permit is available, then take it. Retries on `EINTR`.
-    fn acquire(&self) {
-        // SAFETY: as in `try_acquire`, `self.0` is an initialized, not-yet-destroyed semaphore.
-        unsafe { while libc::sem_wait(self.0.get()) != 0 {} }
+    /// Block until a permit is available, then take it. Retries on `EINTR`; any other failure
+    /// means the semaphore is unusable and is returned instead of retried forever.
+    fn acquire(&self) -> Result<(), ListenError> {
+        loop {
+            // SAFETY: as in `try_acquire`, `self.0` is an initialized, not-yet-destroyed semaphore.
+            if unsafe { libc::sem_wait(self.0.get()) } == 0 {
+                return Ok(());
+            }
+            let e = errno();
+            if e != libc::EINTR {
+                dbgprintln!("sem_wait failed: errno {e}");
+                return Err(ListenError::Io);
+            }
+        }
     }
 
     /// Return a permit taken by `try_acquire` or `acquire`.
+    /// Failure (`EOVERFLOW` from releasing more than was taken, or `EINVAL`) is a bug with no
+    /// recovery at the call sites, so it is logged rather than returned.
     fn release(&self) {
         // SAFETY: as in `try_acquire`, `self.0` is an initialized, not-yet-destroyed semaphore.
-        unsafe { libc::sem_post(self.0.get()) };
+        if unsafe { libc::sem_post(self.0.get()) } != 0 {
+            dbgprintln!("sem_post failed: errno {}", errno());
+        }
     }
 }
 
@@ -143,6 +187,13 @@ impl Drop for Semaphore {
         // `sem_wait` on it (POSIX requires that for `sem_destroy`), and `Drop` runs exactly once.
         unsafe { libc::sem_destroy(self.0.get()) };
     }
+}
+
+/// The calling thread's `errno`, read right after the libc call that failed.
+fn errno() -> i32 {
+    // SAFETY: the platform's `errno` accessor always returns a valid pointer to the calling thread's
+    // `errno`.
+    unsafe { *errno_ptr() }
 }
 
 /// Spawn a detached pthread running `f`. The thread reclaims its own OS resources on exit; there is
@@ -215,7 +266,7 @@ mod tests {
 
     #[test]
     fn try_acquire_respects_cap() {
-        let sem = Semaphore::new(1);
+        let sem = Semaphore::new(1).unwrap();
         assert!(sem.try_acquire());
         assert!(
             !sem.try_acquire(),
@@ -230,7 +281,7 @@ mod tests {
 
     #[test]
     fn acquire_blocks_until_a_permit_is_released() {
-        let sem = Arc::new(Semaphore::new(2));
+        let sem = Semaphore::new(2).unwrap();
         assert!(sem.try_acquire());
         assert!(sem.try_acquire());
 
@@ -242,9 +293,22 @@ mod tests {
         });
 
         // Returns only once both permits above have been released.
-        sem.acquire();
-        sem.acquire();
+        sem.acquire().unwrap();
+        sem.acquire().unwrap();
         releaser.join().unwrap();
+    }
+
+    // `c_uint::MAX` fits the type but is above every POSIX `SEM_VALUE_MAX` (glibc/musl: `INT_MAX`),
+    // so `sem_init` fails with `EINVAL`; `new` must report that instead of using the uninitialized
+    // semaphore.
+    #[test]
+    fn new_errors_when_permits_exceed_sem_value_max() {
+        let result = Semaphore::new(libc::c_uint::MAX as usize);
+
+        assert!(
+            result.is_err(),
+            "sem_init should reject c_uint::MAX permits"
+        );
     }
 
     #[derive(Default)]
