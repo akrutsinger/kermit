@@ -26,14 +26,14 @@ compile_error!("listen: OS features are mutually exclusive; enable only one");
 #[cfg(feature = "linux")]
 mod linux;
 #[cfg(feature = "linux")]
-pub use linux::{FILTER, Source};
+pub use linux::{Alloc, FILTER, Source, abort, entry};
 
 // #[cfg(any(feature = "macos", feature = "freebsd", feature = "openbsd"))]
 // mod bsd;
 // #[cfg(any(feature = "macos", feature = "freebsd", feature = "openbsd"))]
-// pub use bsd::{FILTER, Source};
+// pub use bsd::{Alloc, FILTER, Source, abort, entry};
 
 // #[cfg(feature = "windows")]
 // mod windows;
 // #[cfg(feature = "windows")]
-// pub use windows::{FILTER, Source};
+// pub use windows::{Alloc, FILTER, Source, abort, entry};

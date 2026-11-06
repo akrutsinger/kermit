@@ -8,6 +8,9 @@ use rustix::net::{AddressFamily, Protocol, RecvFlags, SocketFlags, SocketType, s
 use crate::filter::SockFilter;
 use crate::source::{ListenError, PacketSource};
 
+mod process;
+pub use process::{LibcAlloc as Alloc, abort, entry};
+
 const RECV_BUF_SIZE: usize = 2048;
 
 // The typed errno is diagnostic-only (nothing branches on it), so it's logged here and erased to the

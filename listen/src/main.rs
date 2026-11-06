@@ -1,13 +1,6 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 
-extern crate alloc;
-
-mod filter;
-mod os;
-mod runtime;
-mod source;
-
 // Everything below only exists in the real no_std/no_main binary: `cfg(test)` builds run under
 // std's own test harness, which supplies its own `main` and needs `std`, not this allocator/panic
 // handler/entry point.
@@ -18,29 +11,17 @@ mod entry {
     use crypto::check_and_record_nonce;
     use getrandom::fill;
 
-    use crate::os;
-    use crate::runtime;
-    use crate::source::PacketSource as _;
-
-    struct LibcAlloc;
-
-    unsafe impl core::alloc::GlobalAlloc for LibcAlloc {
-        unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-            unsafe { libc::memalign(layout.align(), layout.size()) as *mut u8 }
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, _: core::alloc::Layout) {
-            unsafe { libc::free(ptr as *mut libc::c_void) }
-        }
-    }
+    use listen::os;
+    use listen::runtime;
+    use listen::source::PacketSource as _;
 
     #[global_allocator]
-    static ALLOCATOR: LibcAlloc = LibcAlloc;
+    static ALLOCATOR: os::Alloc = os::Alloc;
 
     #[panic_handler]
     fn panic(info: &core::panic::PanicInfo) -> ! {
         dbgprintln!("panic: {info}");
-        unsafe { libc::abort() }
+        os::abort()
     }
 
     // The precompiled liballoc rlib is built with panic=unwind and references this symbol. Provide a
@@ -75,18 +56,11 @@ mod entry {
     }
 
     #[cfg(feature = "runtime-threads")]
-    #[unsafe(no_mangle)]
-    extern "C" fn main(argc: i32, argv: *const *const u8) -> i32 {
-        let iface: Option<&str> = if argc > 1 {
-            unsafe {
-                core::ffi::CStr::from_ptr(*argv.add(1) as *const core::ffi::c_char)
-                    .to_str()
-                    .ok()
-            }
-        } else {
-            None
-        };
+    os::entry!(app_main);
 
+    /// OS-agnostic program body; the per-OS `os::entry!` shim hands it the first CLI argument.
+    #[cfg(feature = "runtime-threads")]
+    fn app_main(iface: Option<&str>) -> i32 {
         let mut src = match os::Source::open(iface) {
             Ok(src) => src,
             Err(e) => {
