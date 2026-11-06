@@ -3,5 +3,15 @@ name = "common"
 version = "0.1.0"
 edition.workspace = true
 
-[dependencies]
+# Platform backends are picked by the compile target (ADR-0008).
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
+rustix = { workspace = true, features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+] }

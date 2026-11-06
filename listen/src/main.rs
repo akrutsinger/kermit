@@ -6,7 +6,7 @@
 // handler/entry point.
 #[cfg(not(test))]
 mod entry {
-    use common::dbgprintln;
+    use common::{dbgprintln, with_locked_ring};
     use crypto::NONCE_WINDOW;
     use crypto::check_and_record_nonce;
     use getrandom::fill;
@@ -16,12 +16,12 @@ mod entry {
     use listen::source::PacketSource as _;
 
     #[global_allocator]
-    static ALLOCATOR: os::Alloc = os::Alloc;
+    static ALLOCATOR: common::Alloc = common::Alloc;
 
     #[panic_handler]
     fn panic(info: &core::panic::PanicInfo) -> ! {
         dbgprintln!("panic: {info}");
-        os::abort()
+        common::abort()
     }
 
     // The precompiled liballoc rlib is built with panic=unwind and references this symbol. Provide a
@@ -43,7 +43,7 @@ mod entry {
             dbgprintln!("failed to generate nonce: {e}");
             return;
         }
-        if let Err(e) = check_and_record_nonce(&nonce, &base_key) {
+        if let Err(e) = with_locked_ring(|ring| check_and_record_nonce(ring, &nonce, &base_key)) {
             dbgprintln!("nonce check failed: {e}");
             return;
         }
@@ -56,9 +56,10 @@ mod entry {
     }
 
     #[cfg(feature = "runtime-threads")]
-    os::entry!(app_main);
+    common::entry!(app_main);
 
-    /// OS-agnostic program body; the per-OS `os::entry!` shim hands it the first CLI argument.
+    /// OS-agnostic program body; the per-target `common::entry!` shim hands it the first CLI
+    /// argument.
     #[cfg(feature = "runtime-threads")]
     fn app_main(iface: Option<&str>) -> i32 {
         let mut src = match os::Source::open(iface) {

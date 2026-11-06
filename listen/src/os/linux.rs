@@ -8,9 +8,6 @@ use rustix::net::{AddressFamily, Protocol, RecvFlags, SocketFlags, SocketType, s
 use crate::filter::SockFilter;
 use crate::source::{ListenError, PacketSource};
 
-mod process;
-pub use process::{LibcAlloc as Alloc, abort, entry};
-
 const RECV_BUF_SIZE: usize = 2048;
 
 // The typed errno is diagnostic-only (nothing branches on it), so it's logged here and erased to the
@@ -141,11 +138,7 @@ impl PacketSource for Source {
         };
 
         if rc < 0 {
-            // SAFETY: `__errno_location` always returns a valid pointer to this thread's `errno`,
-            // and it is read right after the failing call, before anything else can overwrite it.
-            return Err(io_err(Errno::from_raw_os_error(unsafe {
-                *libc::__errno_location()
-            })));
+            return Err(io_err(Errno::from_raw_os_error(common::errno())));
         }
 
         Ok(())

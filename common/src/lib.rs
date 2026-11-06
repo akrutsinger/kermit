@@ -1,16 +1,32 @@
+//! The platform layer: every OS- or board-specific service the other crates need, one backend per
+//! compile target (ADR-0008, ADR-0009). The debug output sink behind `dbgprintln!`, the process
+//! glue a binary needs once (`Alloc`, `abort`, `entry!`), and the locked nonce-ring store
+//! (`with_locked_ring`). Unix also exposes `errno`.
 #![no_std]
 
-pub struct StdoutWriter;
+extern crate alloc;
 
-impl core::fmt::Write for StdoutWriter {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        // SAFETY: `s.as_ptr()` is valid for reads of `s.len()` bytes for the whole call, and `write`
-        // only reads from it. fd 1 needs no validity guarantee: if stdout is closed or invalid,
-        // `write` just fails with `EBADF`.
-        unsafe { libc::write(1, s.as_ptr() as *const libc::c_void, s.len()) };
-        Ok(())
-    }
-}
+#[cfg(not(any(unix, windows, target_os = "none")))]
+compile_error!("common: no platform backend for this target yet");
+
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+pub use unix::{LibcAlloc as Alloc, StdoutWriter, abort, entry, errno, with_locked_ring};
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::{StdoutWriter, WinAlloc as Alloc, abort, entry, with_locked_ring};
+
+#[cfg(target_os = "none")]
+mod none;
+#[cfg(target_os = "none")]
+pub use none::{BoardAlloc as Alloc, StdoutWriter, abort, entry, with_locked_ring};
+
+/// A platform I/O failure. Payload-free: the typed OS error is logged where it happens (ADR-0003).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoError;
 
 #[macro_export]
 macro_rules! dbgprintln {

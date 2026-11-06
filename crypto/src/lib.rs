@@ -22,7 +22,8 @@
 //! let wire  = proto.seal(message)?;               // -> nonce ‖ tag ‖ ciphertext
 //! // ...send `wire`, then on the receiver...
 //! let (nonce, message) = proto.open(&wire)?;       // verify tag, decrypt (or Err)
-//! check_and_record_nonce(&nonce, base_key)?;       // reject replays, gated behind open()
+//! // reject replays, gated behind open(); the ring is persisted by the platform layer
+//! common::with_locked_ring(|ring| check_and_record_nonce(ring, &nonce, base_key))?;
 //! ```
 //!
 //! Callers that cannot allocate (embedded) use [`StreamAead::seal_into`] and
@@ -61,15 +62,11 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
-use common::dbgprintln;
-
 use chacha20::ChaCha20;
 use cipher::{KeyIvInit, StreamCipher};
 use getrandom::fill;
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
-#[cfg(all(not(test), unix))]
-use rustix::fs::{FlockOperation, Mode, OFlags, SeekFrom, flock};
 use sha2::Sha256;
 
 /// Number of recent nonces retained for replay detection.
@@ -106,6 +103,14 @@ impl core::fmt::Display for ProtoError {
 }
 
 impl core::error::Error for ProtoError {}
+
+/// Lets `check_and_record_nonce` run inside `common::with_locked_ring`, whose own storage failures
+/// surface as `ProtoError::Io`.
+impl From<common::IoError> for ProtoError {
+    fn from(_: common::IoError) -> Self {
+        ProtoError::Io
+    }
+}
 
 /// The seal/open envelope interface: turn a message into authenticated wire bytes and back.
 pub trait Protocol {
@@ -185,115 +190,46 @@ fn stream_xor_in_place<S: KeyIvInit + StreamCipher>(
     Ok(())
 }
 
-/// Check the nonce ring for `nonce`; return `Err(NoncePresent)` if found, otherwise record it and
+/// Check the nonce `ring` for `nonce`; return `Err(NoncePresent)` if found, otherwise record it and
 /// return `Ok(())`. The slot size follows `nonce.len()`, so the same length must be used for the
 /// lifetime of a given `base_key`'s ring (it is fixed by the `StreamAead` `NONCE_LEN` parameter).
 ///
-/// On-disk layout: `1 + NONCE_WINDOW * nonce.len()` bytes of ChaCha20-encrypted ring buffer. Fixed
-/// zero IV is safe because the derived key is unique per session. Plaintext layout: `[head:
-/// u8][slot_0..slot_N-1]`.
-pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), ProtoError> {
+/// Pure: `ring` is the stored bytes (empty the first time), and the caller persists whatever is
+/// left in it -- normally by calling this inside `common::with_locked_ring`, which holds the lock
+/// across the whole read-check-write. Stored layout: `1 + NONCE_WINDOW * nonce.len()` bytes of
+/// ChaCha20-encrypted ring buffer. Fixed zero IV is safe because the derived key is unique per
+/// session. Plaintext layout: `[head: u8][slot_0..slot_N-1]`.
+pub fn check_and_record_nonce(
+    ring: &mut Vec<u8>,
+    nonce: &[u8],
+    base_key: &[u8],
+) -> Result<(), ProtoError> {
     let n = nonce.len();
     let file_len = 1 + NONCE_WINDOW * n;
     let file_key = derive_key(base_key, b"nonce-file:key:v1")?;
     let iv = [0u8; CHACHA20_NONCE_LEN];
 
-    with_locked_ring(|ring| {
-        // A ring of the expected length is prior (encrypted) content to decrypt; anything else (a
-        // new or malformed file) starts from a zero ring.
-        if ring.len() == file_len {
-            stream_xor_in_place::<ChaCha20>(&file_key, &iv, ring)?;
-        } else {
-            ring.clear();
-            ring.resize(file_len, 0);
-        }
-
-        let head = (ring[0] as usize) % NONCE_WINDOW;
-
-        for i in 0..NONCE_WINDOW {
-            if &ring[1 + i * n..1 + (i + 1) * n] == nonce {
-                return Err(ProtoError::NoncePresent);
-            }
-        }
-
-        ring[1 + head * n..1 + (head + 1) * n].copy_from_slice(nonce);
-        ring[0] = ((head + 1) % NONCE_WINDOW) as u8;
-
-        stream_xor_in_place::<ChaCha20>(&file_key, &iv, ring)
-    })
-}
-
-/// Give `f` exclusive, locked access to the raw nonce-ring bytes: the current file contents (empty
-/// the first time, before anything has been written) go in, and whatever `f` leaves in the buffer is
-/// persisted back. Locking and persistence only -- `f` (`check_and_record_nonce`) owns deciding
-/// whether those bytes are prior content, decrypting them, the replay check, and re-encrypting.
-///
-/// The replay window is a read-modify-write on shared state with no serialization of its own. Under
-/// the multi-threaded handler pool (and, for the hosted backend, across concurrent processes) two
-/// callers could otherwise both read the ring, both miss a nonce, and both record it, leaving a
-/// hole in the replay window. Locking serializes the whole critical section, and the result is only
-/// persisted on `Ok` -- a rejected replay (`Err`) leaves the stored ring untouched.
-// `rustix::fs` (open/flock/read/write/seek) only exists on Unix -- rustix's Windows support covers
-// `net` only, and bare-metal targets have no filesystem -- so this body only applies to Unix.
-#[cfg(all(not(test), unix))]
-fn with_locked_ring<T>(
-    f: impl FnOnce(&mut Vec<u8>) -> Result<T, ProtoError>,
-) -> Result<T, ProtoError> {
-    // The typed errno is diagnostic-only (nothing branches on it), so it's logged here and erased to
-    // the payload-free marker (ADR-0003).
-    fn io_err(e: rustix::io::Errno) -> ProtoError {
-        dbgprintln!("nonce io: {e:?}");
-        ProtoError::Io
+    // A ring of the expected length is prior (encrypted) content to decrypt; anything else (a new or
+    // malformed store) starts from a zero ring.
+    if ring.len() == file_len {
+        stream_xor_in_place::<ChaCha20>(&file_key, &iv, ring)?;
+    } else {
+        ring.clear();
+        ring.resize(file_len, 0);
     }
 
-    let fd = rustix::fs::open(
-        c"/tmp/nonce",
-        OFlags::RDWR | OFlags::CREATE,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .map_err(io_err)?;
+    let head = (ring[0] as usize) % NONCE_WINDOW;
 
-    // LOCK_EX serializes the whole critical section; the lock releases when `fd` is dropped at the
-    // end of this function.
-    flock(&fd, FlockOperation::LockExclusive).map_err(io_err)?;
-
-    let mut ring = Vec::new();
-    let mut chunk = [0u8; 64];
-    loop {
-        let read = rustix::io::read(&fd, &mut chunk).map_err(io_err)?;
-        if read == 0 {
-            break;
+    for i in 0..NONCE_WINDOW {
+        if &ring[1 + i * n..1 + (i + 1) * n] == nonce {
+            return Err(ProtoError::NoncePresent);
         }
-        ring.extend_from_slice(&chunk[..read]);
     }
 
-    let result = f(&mut ring)?;
+    ring[1 + head * n..1 + (head + 1) * n].copy_from_slice(nonce);
+    ring[0] = ((head + 1) % NONCE_WINDOW) as u8;
 
-    rustix::fs::seek(&fd, SeekFrom::Start(0)).map_err(io_err)?;
-    rustix::io::write(&fd, &ring).map_err(io_err)?;
-    Ok(result)
-}
-
-// No Windows or bare-metal nonce-store backend exists yet (Windows would need direct `windows-sys`
-// file locking, e.g. `CreateFileW` + `LockFileEx`). Fail loudly at compile time rather than deep
-// inside a missing `rustix` with a confusing "module not found".
-#[cfg(all(not(test), not(unix)))]
-compile_error!("crypto: no nonce-store backend for this target yet.");
-
-/// Test backend: a nonce ring per test thread. libtest runs each `#[test]` on its own thread, so
-/// calls within a test share the ring (persisting the encrypted bytes across calls, same as the
-/// file) while separate tests stay isolated, without touching a real file.
-#[cfg(test)]
-fn with_locked_ring<T>(
-    f: impl FnOnce(&mut Vec<u8>) -> Result<T, ProtoError>,
-) -> Result<T, ProtoError> {
-    use std::cell::RefCell;
-
-    thread_local! {
-        static RING: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-    }
-
-    RING.with(|cell| f(&mut cell.borrow_mut()))
+    stream_xor_in_place::<ChaCha20>(&file_key, &iv, ring)
 }
 
 /// Stateless authenticated-encryption envelope: encrypt-then-MAC with an explicit random nonce.
@@ -449,6 +385,7 @@ impl<S: KeyIvInit + StreamCipher, const NONCE_LEN: usize, const TAG_LEN: usize> 
 mod tests {
     use super::*;
     use chacha20::ChaCha20;
+    use common::dbgprintln;
 
     const KEY: &[u8] = b"kermit-crypto-unit-test-base-key";
     const MSG: &[u8] = b"hello, kermit!";
@@ -622,16 +559,18 @@ mod tests {
     #[test]
     fn replay_check_accepts_first_seen_nonce() {
         let key = b"replay-test-key-first-seen-0000";
-        assert!(check_and_record_nonce(&[1u8; 8], key).is_ok());
+        let mut ring = Vec::new();
+        assert!(check_and_record_nonce(&mut ring, &[1u8; 8], key).is_ok());
     }
 
     #[test]
     fn replay_check_rejects_immediate_replay() {
         let key = b"replay-test-key-immediate-00000";
         let nonce = [2u8; 8];
-        assert!(check_and_record_nonce(&nonce, key).is_ok());
+        let mut ring = Vec::new();
+        assert!(check_and_record_nonce(&mut ring, &nonce, key).is_ok());
         assert_eq!(
-            check_and_record_nonce(&nonce, key),
+            check_and_record_nonce(&mut ring, &nonce, key),
             Err(ProtoError::NoncePresent)
         );
     }
@@ -642,12 +581,13 @@ mod tests {
         // Start at 1: an all-zero nonce would be indistinguishable from a fresh, never-written ring
         // slot (both are all-zero bytes), which isn't what this test means to exercise.
         let nonces: Vec<[u8; 8]> = (1..=NONCE_WINDOW + 1).map(|i| [i as u8; 8]).collect();
+        let mut ring = Vec::new();
         for nonce in &nonces {
-            assert!(check_and_record_nonce(nonce, key).is_ok());
+            assert!(check_and_record_nonce(&mut ring, nonce, key).is_ok());
         }
         // NONCE_WINDOW + 1 distinct nonces have been recorded, so the first one has been evicted by
         // wraparound; it's accepted again instead of rejected as a replay.
-        assert!(check_and_record_nonce(&nonces[0], key).is_ok());
+        assert!(check_and_record_nonce(&mut ring, &nonces[0], key).is_ok());
     }
 
     #[test]

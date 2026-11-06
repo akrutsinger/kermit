@@ -9,16 +9,9 @@ use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
 
-use common::dbgprintln;
+use common::{dbgprintln, errno};
 
 use crate::source::{ListenError, PacketSource};
-
-#[cfg(target_os = "openbsd")]
-use libc::__errno as errno_ptr;
-#[cfg(target_os = "linux")]
-use libc::__errno_location as errno_ptr;
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-use libc::__error as errno_ptr;
 
 const FRAME_LEN: usize = 2048;
 
@@ -187,13 +180,6 @@ impl Drop for Semaphore {
         // `sem_wait` on it (POSIX requires that for `sem_destroy`), and `Drop` runs exactly once.
         unsafe { libc::sem_destroy(self.0.get()) };
     }
-}
-
-/// The calling thread's `errno`, read right after the libc call that failed.
-fn errno() -> i32 {
-    // SAFETY: the platform's `errno` accessor always returns a valid pointer to the calling thread's
-    // `errno`.
-    unsafe { *errno_ptr() }
 }
 
 /// Spawn a detached pthread running `f`. The thread reclaims its own OS resources on exit; there is

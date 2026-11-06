@@ -121,6 +121,8 @@ name = "common"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustix",
+ "windows-sys",
 ]
 
 [[package]]
@@ -142,7 +144,6 @@ dependencies = [
  "getrandom",
  "hkdf",
  "hmac",
- "rustix",
  "sha2",
 ]
 
