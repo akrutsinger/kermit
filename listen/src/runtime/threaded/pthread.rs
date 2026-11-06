@@ -100,35 +100,47 @@ where
 /// `acquire` blocks until one is available.
 struct Semaphore(UnsafeCell<libc::sem_t>);
 
+// SAFETY: a process-private (`pshared = 0`) `sem_t` has no thread affinity: any thread of this
+// process may post, wait on, or destroy it, so ownership can move between threads.
 unsafe impl Send for Semaphore {}
+// SAFETY: POSIX specifies `sem_wait`/`sem_trywait`/`sem_post` as safe to call concurrently on the
+// same semaphore, and those are the only operations `&Semaphore` exposes.
 unsafe impl Sync for Semaphore {}
 
 impl Semaphore {
     fn new(permits: u32) -> Self {
         let mut sem = MaybeUninit::<libc::sem_t>::uninit();
         // pshared = 0: shared between threads of this process, not across processes.
+        // SAFETY: `sem.as_mut_ptr()` points to writable, properly aligned storage for a `sem_t`,
+        // which `sem_init` initializes in place.
         unsafe { libc::sem_init(sem.as_mut_ptr(), 0, permits) };
         Semaphore(UnsafeCell::new(unsafe { sem.assume_init() }))
     }
 
     /// Take a permit without blocking. Returns false if none are available.
     fn try_acquire(&self) -> bool {
+        // SAFETY: `self.0` holds the semaphore initialized in `new`, and it stays initialized until
+        // `Drop`, which can't run while `&self` is borrowed.
         unsafe { libc::sem_trywait(self.0.get()) == 0 }
     }
 
     /// Block until a permit is available, then take it. Retries on `EINTR`.
     fn acquire(&self) {
+        // SAFETY: as in `try_acquire`, `self.0` is an initialized, not-yet-destroyed semaphore.
         unsafe { while libc::sem_wait(self.0.get()) != 0 {} }
     }
 
     /// Return a permit taken by `try_acquire` or `acquire`.
     fn release(&self) {
+        // SAFETY: as in `try_acquire`, `self.0` is an initialized, not-yet-destroyed semaphore.
         unsafe { libc::sem_post(self.0.get()) };
     }
 }
 
 impl Drop for Semaphore {
     fn drop(&mut self) {
+        // SAFETY: `&mut self` means no other reference exists, so no thread can be blocked in
+        // `sem_wait` on it (POSIX requires that for `sem_destroy`), and `Drop` runs exactly once.
         unsafe { libc::sem_destroy(self.0.get()) };
     }
 }
@@ -137,6 +149,9 @@ impl Drop for Semaphore {
 /// no handle to join because `run` tracks completion through `Semaphore`, not thread identity.
 fn spawn_detached<F: FnOnce() + Send + 'static>(f: F) -> Result<(), ListenError> {
     extern "C" fn trampoline(arg: *mut c_void) -> *mut c_void {
+        // SAFETY: `arg` is the pointer `spawn_detached` made with `Box::into_raw` on a
+        // `Box<Box<dyn FnOnce() + Send>>`, and `pthread_create` passes it to exactly one trampoline
+        // call, so ownership is reclaimed exactly once and with the original type.
         let f: Box<Box<dyn FnOnce() + Send>> = unsafe { Box::from_raw(arg as *mut _) };
         f();
         core::ptr::null_mut()
@@ -147,13 +162,20 @@ fn spawn_detached<F: FnOnce() + Send + 'static>(f: F) -> Result<(), ListenError>
     let arg = Box::into_raw(boxed) as *mut c_void;
 
     let mut handle: libc::pthread_t = 0;
+    // SAFETY: `handle` is a valid out-pointer, a null attr selects defaults, `trampoline` has the
+    // `extern "C" fn(*mut c_void) -> *mut c_void` signature pthreads expects, and `arg` stays valid
+    // (leaked, `'static + Send`) until the new thread takes ownership of it.
     let rc = unsafe { libc::pthread_create(&mut handle, core::ptr::null(), trampoline, arg) };
     if rc != 0 {
         // Thread never started; reclaim the closure we leaked into `arg`.
+        // SAFETY: on failure no thread received `arg`, so we still own the `Box::into_raw`
+        // allocation and free it exactly once, with the type it was created as.
         unsafe { drop(Box::from_raw(arg as *mut Box<dyn FnOnce() + Send>)) };
         dbgprintln!("pthread_create failed: {rc}");
         return Err(ListenError::Io);
     }
+    // SAFETY: `handle` was filled in by the successful `pthread_create` above and hasn't been joined
+    // or detached; detaching a thread that has already exited is valid and frees it immediately.
     unsafe { libc::pthread_detach(handle) };
     Ok(())
 }

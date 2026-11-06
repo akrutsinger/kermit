@@ -4,6 +4,9 @@ pub struct StdoutWriter;
 
 impl core::fmt::Write for StdoutWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        // SAFETY: `s.as_ptr()` is valid for reads of `s.len()` bytes for the whole call, and `write`
+        // only reads from it. fd 1 needs no validity guarantee: if stdout is closed or invalid,
+        // `write` just fails with `EBADF`.
         unsafe { libc::write(1, s.as_ptr() as *const libc::c_void, s.len()) };
         Ok(())
     }

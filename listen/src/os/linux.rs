@@ -123,6 +123,10 @@ impl PacketSource for Source {
             filter: prog.as_ptr() as *mut _,
         };
 
+        // SAFETY: `self.fd` is an open socket we own. `fprog` lives across the call and points at
+        // `prog`, whose `#[repr(C)]` `SockFilter`s match the kernel's `struct sock_filter`; `len`
+        // never exceeds `prog.len()`. The kernel copies the program during the call (it never
+        // writes through `filter` despite the `*mut`), and `optlen` is the exact `sock_fprog` size.
         let rc = unsafe {
             libc::setsockopt(
                 self.fd.as_raw_fd(),
@@ -134,6 +138,8 @@ impl PacketSource for Source {
         };
 
         if rc < 0 {
+            // SAFETY: `__errno_location` always returns a valid pointer to this thread's `errno`,
+            // and it is read right after the failing call, before anything else can overwrite it.
             return Err(io_err(Errno::from_raw_os_error(unsafe {
                 *libc::__errno_location()
             })));
