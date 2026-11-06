@@ -6,7 +6,6 @@ Usage: sudo python3 send_ntp.py [iface] [dst_ip]
 """
 
 import base64
-import os
 import sys
 
 from scapy.all import IP, UDP, Ether, Raw, get_if_addr, sendp
@@ -42,24 +41,19 @@ def to_base64(data: bytes) -> str:
     return base64.b64encode(data).decode()
 
 
-def prepend_nonce(msg: bytes, n: int = 8) -> bytes:
-    """Application framing: append `n` random replay-nonce bytes to the message.
-    Done by the caller before sealing, never inside the crypto layer."""
-    return os.urandom(n) + msg
-
-
 if __name__ == "__main__":
     main()
 
-    p = cipher.SivCipher(n=4)
-    framed = prepend_nonce(b"123456")  # msg || 8-byte app nonce
-    wire = p.seal(framed)
-    print(f"framed : {framed!r}  ({len(framed)} bytes)")
+    p = cipher.StreamAead(nonce_len=8, tag_len=4)
+    msg = b"123456"
+    wire = p.seal(msg)
+    print(f"message: {msg!r}  ({len(msg)} bytes)")
     print(
-        f"wire   : {wire.hex()}  ({len(wire)} bytes total, {p.n} prepended tag bytes)"
+        f"wire   : {wire.hex()}  ({len(wire)} bytes total, {p.overhead} nonce+tag bytes)"
     )
-    print(f"opened : {p.open(wire)!r}")
-    assert p.open(wire) == framed
+    nonce, opened = p.open(wire)
+    print(f"opened : {opened!r}  (nonce {nonce.hex()})")
+    assert opened == msg
 
     print(f"base64 : {to_base64(wire)}")
 
