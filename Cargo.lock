@@ -280,6 +280,7 @@ dependencies = [
  "getrandom",
  "libc",
  "rustix",
+ "windows-sys",
 ]
 
 [[package]]

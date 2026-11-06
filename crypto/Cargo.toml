@@ -14,3 +14,6 @@ hkdf.workspace = true
 hmac.workspace = true
 getrandom.workspace = true
 sha2.workspace = true
+
+[lints]
+workspace = true

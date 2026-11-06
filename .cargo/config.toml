@@ -1,0 +1,4 @@
+# Bare metal has no OS entropy source, so getrandom uses its custom backend there: the final
+# firmware binary must define `__getrandom_v03_custom` (see getrandom's docs) once a board is chosen.
+[target.'cfg(target_os = "none")']
+rustflags = ['--cfg', 'getrandom_backend="custom"']

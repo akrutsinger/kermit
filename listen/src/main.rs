@@ -1,6 +1,12 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 
+// Only the Linux backend has been run on real hardware. The others type-check as a library
+// (`scripts/check-targets.sh`), but the binary isn't built for them until they've been verified,
+// rather than shipping something that looks done but was never run.
+#[cfg(not(target_os = "linux"))]
+compile_error!("listen: only Linux has been verified; check other targets with `--lib`");
+
 // Everything below only exists in the real no_std/no_main binary: `cfg(test)` builds run under
 // std's own test harness, which supplies its own `main` and needs `std`, not this allocator/panic
 // handler/entry point.

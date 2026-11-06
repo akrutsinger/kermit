@@ -115,6 +115,14 @@ impl Semaphore {
     /// Create a semaphore holding `permits` permits, initialized in place in its final `Arc`.
     /// Errors if `permits` exceeds what the OS allows (`SEM_VALUE_MAX`) or the OS has no unnamed
     /// semaphores (macOS).
+    #[cfg_attr(
+        target_os = "macos",
+        expect(
+            deprecated,
+            reason = "macOS has no unnamed POSIX semaphores, so `sem_init` fails at runtime there \
+                      until the per-OS runtime split gives macOS its own semaphore"
+        )
+    )]
     fn new(permits: usize) -> Result<Arc<Self>, ListenError> {
         let Ok(permits) = libc::c_uint::try_from(permits) else {
             dbgprintln!("semaphore permits {permits} exceed c_uint");
@@ -175,6 +183,10 @@ impl Semaphore {
 }
 
 impl Drop for Semaphore {
+    #[cfg_attr(
+        target_os = "macos",
+        expect(deprecated, reason = "see `Semaphore::new`")
+    )]
     fn drop(&mut self) {
         // SAFETY: `&mut self` means no other reference exists, so no thread can be blocked in
         // `sem_wait` on it (POSIX requires that for `sem_destroy`), and `Drop` runs exactly once.

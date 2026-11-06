@@ -26,6 +26,10 @@ sha2 = { version = "0.11", default-features = false }
 shlex = { version = "2.0", default-features = false }
 windows-sys = { version = "0.61", default-features = false }
 
+[workspace.lints.clippy]
+# Every `unsafe` block or impl states why it's sound in a `// SAFETY:` comment.
+undocumented_unsafe_blocks = "deny"
+
 [profile.dev]
 panic = "abort"
 

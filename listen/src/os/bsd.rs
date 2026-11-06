@@ -1,14 +1,26 @@
-// TODO: rewrite for no_std; currently uses std::io, Vec, and format!().
-// try_recv() needs O_NONBLOCK on the BPF fd + EAGAIN handling (similar to linux).
+//! macOS/FreeBSD/OpenBSD packet listener on a `/dev/bpf*` device with a cBPF filter.
+//!
+//! Type-checked for its targets but never run on real hardware yet, so the `listen` binary still
+//! refuses to build for them (see `main.rs`).
 
-use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use alloc::vec;
+use alloc::vec::Vec;
+use core::ffi::CStr;
 
+use common::dbgprintln;
+use rustix::fd::{AsRawFd, OwnedFd};
 use rustix::fs::{Mode, OFlags, open};
-use rustix::io::read;
+use rustix::io::{Errno, read};
 
 use crate::filter::SockFilter;
 use crate::source::{ListenError, PacketSource};
+
+// The typed errno is diagnostic-only (nothing branches on it), so it's logged here and erased to the
+// payload-free marker (ADR-0003).
+fn io_err(e: Errno) -> ListenError {
+    dbgprintln!("io error: {e:?}");
+    ListenError::Io
+}
 
 // tcpdump -dd "udp and src host 1.2.3.4"  (direction handled by ioctl)
 pub static FILTER: [SockFilter; 8] = [
@@ -68,7 +80,7 @@ pub static FILTER: [SockFilter; 8] = [
 #[cfg(target_os = "macos")]
 const BPF_ALIGNMENT: usize = 4;
 #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
-const BPF_ALIGNMENT: usize = std::mem::size_of::<libc::c_long>();
+const BPF_ALIGNMENT: usize = size_of::<libc::c_long>();
 
 #[inline]
 fn word_align(x: usize) -> usize {
@@ -82,29 +94,68 @@ pub struct Source {
     valid: usize,
 }
 
+/// `struct bpf_program` from `<net/bpf.h>`. Its layout is the same on every BSD, but libc only binds
+/// it for some of them (not macOS).
+#[repr(C)]
+struct BpfProgram {
+    bf_len: libc::c_uint,
+    bf_insns: *const SockFilter,
+}
+
+/// `/dev/bpf<i>` as a C string, built in a stack buffer instead of a heap `String` (ADR-0004).
+fn bpf_path(i: u8, buf: &mut [u8; 12]) -> &CStr {
+    const PREFIX: &[u8] = b"/dev/bpf";
+    buf.fill(0);
+    buf[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut len = PREFIX.len();
+    let (hundreds, tens, ones) = (i / 100, i / 10 % 10, i % 10);
+    if hundreds > 0 {
+        buf[len] = b'0' + hundreds;
+        len += 1;
+    }
+    if hundreds > 0 || tens > 0 {
+        buf[len] = b'0' + tens;
+        len += 1;
+    }
+    buf[len] = b'0' + ones;
+    // At most 8 + 3 bytes are written, so the zeroed last byte is always a terminating NUL.
+    match CStr::from_bytes_until_nul(buf) {
+        Ok(path) => path,
+        Err(_) => unreachable!("bpf_path always leaves a NUL in the buffer"),
+    }
+}
+
 impl PacketSource for Source {
     type Filter = [SockFilter];
+    // BPF hands back records sized by the runtime-discovered `BIOCGBLEN` buffer, so there's no true
+    // compile-time bound; this is what the threaded runtime keeps, and it logs any truncation.
+    const MAX_FRAME: usize = 2048;
 
     fn open(iface: Option<&str>) -> Result<Self, ListenError> {
         let iface = iface.ok_or(ListenError::NoIface)?;
 
         let mut fd = None;
-        for i in 0..256 {
-            let path = format!("/dev/bpf{}", i);
-            match open(&path, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty()) {
+        let mut path = [0u8; 12];
+        for i in 0..=u8::MAX {
+            match open(
+                bpf_path(i, &mut path),
+                OFlags::RDWR | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
                 Ok(f) => {
                     fd = Some(f);
                     break;
                 }
-                Err(rustix::io::Errno::BUSY) => continue,
-                Err(rustix::io::Errno::ACCESS) | Err(rustix::io::Errno::PERM) => continue,
-                Err(e) => return Err(ListenError::Io(std::io::Error::from(e).kind())),
+                Err(Errno::BUSY | Errno::ACCESS | Errno::PERM) => continue,
+                Err(e) => return Err(io_err(e)),
             }
         }
         let fd = fd.ok_or(ListenError::NoBpfDevice)?;
         let raw = fd.as_raw_fd();
 
-        let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+        // SAFETY: `ifreq` is a plain C struct (a byte array plus a union of integers, addresses and
+        // pointers), for which all-zero bytes are a valid value.
+        let mut ifr: libc::ifreq = unsafe { core::mem::zeroed() };
         let name = iface.as_bytes();
         if name.len() >= ifr.ifr_name.len() {
             return Err(ListenError::IfaceNameTooLong);
@@ -112,26 +163,35 @@ impl PacketSource for Source {
         for (i, &b) in name.iter().enumerate() {
             ifr.ifr_name[i] = b as libc::c_char;
         }
-        ioctl_or_err(raw, libc::BIOCSETIF, &mut ifr as *mut _ as *mut _)?;
+        // SAFETY: `BIOCSETIF` reads an `ifreq`; `ifr` is a valid, NUL-terminated one that lives
+        // across the call.
+        unsafe { ioctl_or_err(raw, libc::BIOCSETIF, (&raw mut ifr).cast()) }?;
 
         let on: u32 = 1;
-        ioctl_or_err(raw, libc::BIOCIMMEDIATE, &on as *const _ as *mut _)?;
+        // SAFETY: `BIOCIMMEDIATE` reads a `u_int`; `on` is one and lives across the call.
+        unsafe { ioctl_or_err(raw, libc::BIOCIMMEDIATE, (&raw const on).cast_mut().cast()) }?;
 
-        // Inbound-only filtering. macOS uses BIOCSSEESENT (0 = don't see sent);
-        // FreeBSD/OpenBSD use BIOCSDIRECTION with BPF_D_IN.
-        #[cfg(target_os = "macos")]
+        // Inbound-only filtering: BIOCSSEESENT with 0 = don't return locally sent packets. macOS
+        // only has this; FreeBSD documents it as obsolete-but-supported next to BIOCSDIRECTION
+        // (which libc doesn't bind). OpenBSD has neither and filters with BIOCSDIRFILT instead.
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
         {
             let see_sent: u32 = 0;
-            ioctl_or_err(raw, libc::BIOCSSEESENT, &see_sent as *const _ as *mut _)?;
+            // SAFETY: `BIOCSSEESENT` reads a `u_int`; `see_sent` is one and lives across the call.
+            unsafe {
+                ioctl_or_err(
+                    raw,
+                    libc::BIOCSSEESENT,
+                    (&raw const see_sent).cast_mut().cast(),
+                )
+            }?;
         }
-        #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
-        {
-            let direction: u32 = libc::BPF_D_IN as u32;
-            ioctl_or_err(raw, libc::BIOCSDIRECTION, &direction as *const _ as *mut _)?;
-        }
+        #[cfg(target_os = "openbsd")]
+        todo!("OpenBSD inbound-only filter: BIOCSDIRFILT with BPF_DIRECTION_OUT");
 
         let mut blen: u32 = 0;
-        ioctl_or_err(raw, libc::BIOCGBLEN, &mut blen as *mut _ as *mut _)?;
+        // SAFETY: `BIOCGBLEN` writes a `u_int`; `blen` is one and lives across the call.
+        unsafe { ioctl_or_err(raw, libc::BIOCGBLEN, (&raw mut blen).cast()) }?;
 
         Ok(Self {
             fd,
@@ -144,44 +204,73 @@ impl PacketSource for Source {
     fn attach_filter(&mut self, prog: &[SockFilter]) -> Result<(), ListenError> {
         // libc::bpf_program { bf_len: u_int, bf_insns: *mut bpf_insn }
         // `bpf_insn` has the same layout as our `SockFilter`.
-        let fprog = libc::bpf_program {
-            bf_len: prog.len() as u32,
-            bf_insns: prog.as_ptr() as *mut _,
+        // Reject a program too long for `bf_len` rather than let its length wrap, as on Linux.
+        let bf_len = u32::try_from(prog.len()).map_err(|_| io_err(Errno::INVAL))?;
+        let fprog = BpfProgram {
+            bf_len,
+            bf_insns: prog.as_ptr(),
         };
-        ioctl_or_err(
-            self.fd.as_raw_fd(),
-            libc::BIOCSETF,
-            &fprog as *const _ as *mut _,
-        )
-    }
-
-    fn try_recv(&mut self) -> Result<Option<&[u8]>, ListenError> {
-        todo!("BPF non-blocking recv: open with O_NONBLOCK, map EAGAIN to Ok(None)")
+        // SAFETY: `BIOCSETF` reads a `bpf_program`; `fprog` is one that lives across the call and
+        // points at `bf_len` `#[repr(C)]` `SockFilter`s, which match the kernel's `bpf_insn`. The
+        // kernel copies the program and never writes through `bf_insns`.
+        unsafe {
+            ioctl_or_err(
+                self.fd.as_raw_fd(),
+                libc::BIOCSETF,
+                (&raw const fprog).cast_mut().cast(),
+            )
+        }
     }
 
     fn recv(&mut self) -> Result<&[u8], ListenError> {
+        let hdr_size = size_of::<libc::bpf_hdr>();
         loop {
-            if self.pos < self.valid {
-                let hdr_ptr = unsafe { self.buf.as_ptr().add(self.pos) } as *const libc::bpf_hdr;
-                let (caplen, hdrlen) =
-                    unsafe { ((*hdr_ptr).bh_caplen as usize, (*hdr_ptr).bh_hdrlen as usize) };
-                let pkt_start = self.pos + hdrlen;
-                let pkt_end = pkt_start + caplen;
+            if self.pos + hdr_size <= self.valid {
+                // SAFETY: `pos + size_of::<bpf_hdr>() <= valid <= buf.len()`, so the read is in
+                // bounds. `read_unaligned` because a `Vec<u8>` only guarantees byte alignment.
+                let hdr = unsafe {
+                    self.buf
+                        .as_ptr()
+                        .add(self.pos)
+                        .cast::<libc::bpf_hdr>()
+                        .read_unaligned()
+                };
+                let pkt_start = self.pos + hdr.bh_hdrlen as usize;
+                let pkt_end = pkt_start + hdr.bh_caplen as usize;
+                if pkt_end > self.valid {
+                    dbgprintln!("listen: malformed bpf record, dropping rest of read");
+                    self.pos = self.valid;
+                    continue;
+                }
                 self.pos = word_align(pkt_end);
                 return Ok(&self.buf[pkt_start..pkt_end]);
             }
-            self.valid = read(&self.fd, &mut self.buf)
-                .map_err(|e| ListenError::Io(std::io::Error::from(e).kind()))?;
+            // Blocking read, so this parks the calling thread until records arrive. EINTR is
+            // retried; everything else is a real error.
+            self.valid = match read(&self.fd, &mut self.buf[..]) {
+                Ok(n) => n,
+                Err(Errno::INTR) => continue,
+                Err(e) => return Err(io_err(e)),
+            };
             self.pos = 0;
         }
     }
 }
 
-fn ioctl_or_err(fd: i32, req: libc::c_ulong, arg: *mut libc::c_void) -> Result<(), ListenError> {
-    let rc = unsafe { libc::ioctl(fd, req, arg) };
-    if rc < 0 {
-        Err(ListenError::Io(io::Error::last_os_error().kind()))
-    } else {
-        Ok(())
+/// `ioctl(fd, req, arg)`, with failure logged and erased to `ListenError::Io` (ADR-0003).
+///
+/// # Safety
+///
+/// `arg` must point to a live value of the type `req` reads or writes.
+unsafe fn ioctl_or_err(
+    fd: i32,
+    req: libc::c_ulong,
+    arg: *mut libc::c_void,
+) -> Result<(), ListenError> {
+    // SAFETY: the caller guarantees `arg` matches what `req` expects; `fd` is just a number to the
+    // kernel, and a bad one fails with `EBADF`.
+    if unsafe { libc::ioctl(fd, req, arg) } < 0 {
+        return Err(io_err(Errno::from_raw_os_error(common::errno())));
     }
+    Ok(())
 }
