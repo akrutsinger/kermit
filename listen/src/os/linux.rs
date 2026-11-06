@@ -118,14 +118,17 @@ impl PacketSource for Source {
     }
 
     fn attach_filter(&mut self, prog: &[SockFilter]) -> Result<(), ListenError> {
+        // `sock_fprog.len` is a `u16`; reject a longer program rather than let its length wrap and
+        // silently attach only a fragment. EINVAL is what the kernel returns for an oversized filter.
+        let len = u16::try_from(prog.len()).map_err(|_| io_err(Errno::INVAL))?;
         let fprog = libc::sock_fprog {
-            len: prog.len() as u16,
+            len,
             filter: prog.as_ptr() as *mut _,
         };
 
         // SAFETY: `self.fd` is an open socket we own. `fprog` lives across the call and points at
         // `prog`, whose `#[repr(C)]` `SockFilter`s match the kernel's `struct sock_filter`; `len`
-        // never exceeds `prog.len()`. The kernel copies the program during the call (it never
+        // is exactly `prog.len()`. The kernel copies the program during the call (it never
         // writes through `filter` despite the `*mut`), and `optlen` is the exact `sock_fprog` size.
         let rc = unsafe {
             libc::setsockopt(
