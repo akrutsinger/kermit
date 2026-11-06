@@ -18,7 +18,8 @@ In one terminal, start the listener (raw sockets need root):
 sudo ./target/debug/listen
 ```
 
-In another, send a packet with `holla.py` (needs `pip install scapy cryptography`, visible to `sudo`):
+In another, send a packet with `holla.py`. It needs [uv](https://docs.astral.sh/uv/), which reads
+the script's dependencies (scapy, cryptography) from its header and installs them on first run:
 
 ```sh
 sudo uv run holla.py            # defaults: interface lo, destination = lo's address

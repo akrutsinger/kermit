@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["scapy", "cryptography"]
+# ///
 """Send a raw UDP NTP packet with spoofed src IP to hit the BPF filter.
 
 The filter matches: IPv4 + UDP + src IP == 1.2.3.4
-Usage: sudo python3 send_ntp.py [iface] [dst_ip]
+Usage: sudo uv run holla.py [iface] [dst_ip]
 """
 
 import base64
