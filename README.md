@@ -45,5 +45,15 @@ matched: 90 bytes
 done processing packet
 ```
 
+Each handled packet also records a nonce in the replay ring at `/tmp/nonce` (33 bytes: a 1-byte head
+plus 4 slots of 8 bytes, encrypted). To watch it change, run this in a third terminal:
+
+```sh
+sudo watch -d -n 0.5 xxd /tmp/nonce
+```
+
+The file appears with the first handled packet. Each packet after that changes the first byte (the
+head) and one 8-byte slot; after 4 packets it wraps around.
+
 Packets from any other source address are ignored. (The `holla/` crate is a separate REPL
 prototype and doesn't send packets yet.)
