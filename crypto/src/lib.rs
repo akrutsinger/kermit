@@ -68,7 +68,7 @@ use cipher::{KeyIvInit, StreamCipher};
 use getrandom::fill;
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
-#[cfg(all(not(test), not(windows)))]
+#[cfg(all(not(test), unix))]
 use rustix::fs::{FlockOperation, Mode, OFlags, SeekFrom, flock};
 use sha2::Sha256;
 
@@ -233,10 +233,9 @@ pub fn check_and_record_nonce(nonce: &[u8], base_key: &[u8]) -> Result<(), Proto
 /// callers could otherwise both read the ring, both miss a nonce, and both record it, leaving a
 /// hole in the replay window. Locking serializes the whole critical section, and the result is only
 /// persisted on `Ok` -- a rejected replay (`Err`) leaves the stored ring untouched.
-// `rustix::fs` (open/flock/read/write/seek) has no Windows backend at all -- rustix's Windows
-// support covers `net` only -- so this hosted body only ever applies to the Linux/BSD targets that
-// actually have it.
-#[cfg(all(not(test), not(windows)))]
+// `rustix::fs` (open/flock/read/write/seek) only exists on Unix -- rustix's Windows support covers
+// `net` only, and bare-metal targets have no filesystem -- so this body only applies to Unix.
+#[cfg(all(not(test), unix))]
 fn with_locked_ring<T>(
     f: impl FnOnce(&mut Vec<u8>) -> Result<T, ProtoError>,
 ) -> Result<T, ProtoError> {
@@ -275,11 +274,11 @@ fn with_locked_ring<T>(
     Ok(result)
 }
 
-// No Windows nonce-store backend exists yet (it would need direct `windows-sys` file locking, e.g.
-// `CreateFileW` + `LockFileEx` and rustix has no `fs` backend on Windows to fall back to). Fail
-// loudly at compile time rather than deep inside `rustix` with a confusing "module not found".
-#[cfg(all(not(test), windows))]
-compile_error!("crypto: windows nonce-store backend not implemented yet.");
+// No Windows or bare-metal nonce-store backend exists yet (Windows would need direct `windows-sys`
+// file locking, e.g. `CreateFileW` + `LockFileEx`). Fail loudly at compile time rather than deep
+// inside a missing `rustix` with a confusing "module not found".
+#[cfg(all(not(test), not(unix)))]
+compile_error!("crypto: no nonce-store backend for this target yet.");
 
 /// Test backend: a nonce ring per test thread. libtest runs each `#[test]` on its own thread, so
 /// calls within a test share the ring (persisting the encrypted bytes across calls, same as the

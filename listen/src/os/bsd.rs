@@ -65,9 +65,9 @@ pub static FILTER: [SockFilter; 8] = [
 // BPF_WORDALIGN alignment differs:
 //   macOS:           sizeof(int32_t) = 4
 //   FreeBSD/OpenBSD: sizeof(long)    = pointer width
-#[cfg(feature = "macos")]
+#[cfg(target_os = "macos")]
 const BPF_ALIGNMENT: usize = 4;
-#[cfg(any(feature = "freebsd", feature = "openbsd"))]
+#[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
 const BPF_ALIGNMENT: usize = std::mem::size_of::<libc::c_long>();
 
 #[inline]
@@ -119,12 +119,12 @@ impl PacketSource for Source {
 
         // Inbound-only filtering. macOS uses BIOCSSEESENT (0 = don't see sent);
         // FreeBSD/OpenBSD use BIOCSDIRECTION with BPF_D_IN.
-        #[cfg(feature = "macos")]
+        #[cfg(target_os = "macos")]
         {
             let see_sent: u32 = 0;
             ioctl_or_err(raw, libc::BIOCSSEESENT, &see_sent as *const _ as *mut _)?;
         }
-        #[cfg(any(feature = "freebsd", feature = "openbsd"))]
+        #[cfg(any(target_os = "freebsd", target_os = "openbsd"))]
         {
             let direction: u32 = libc::BPF_D_IN as u32;
             ioctl_or_err(raw, libc::BIOCSDIRECTION, &direction as *const _ as *mut _)?;

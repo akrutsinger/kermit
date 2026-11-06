@@ -3,13 +3,9 @@ name = "listen"
 version = "0.1.0"
 edition.workspace = true
 
+# The OS backend is chosen by the compile target (`--target`), not by a feature (ADR-0008).
 [features]
-default = ["linux"]
-linux = ["runtime-threads"]
-macos = []
-freebsd = []
-openbsd = []
-windows = []
+default = ["runtime-threads"]
 
 # Concurrency runtime. runtime-threads (thread-per-packet, hosted) is the only runtime today;
 # the embedded async runtime was removed until a target is chosen (ADR-0007).
@@ -22,6 +18,8 @@ crypto.workspace = true
 
 # External
 chacha20.workspace = true
-libc.workspace = true
 getrandom.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 rustix.workspace = true

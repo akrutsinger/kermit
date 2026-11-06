@@ -13,11 +13,11 @@ use common::dbgprintln;
 
 use crate::source::{ListenError, PacketSource};
 
-#[cfg(feature = "openbsd")]
+#[cfg(target_os = "openbsd")]
 use libc::__errno as errno_ptr;
-#[cfg(feature = "linux")]
+#[cfg(target_os = "linux")]
 use libc::__errno_location as errno_ptr;
-#[cfg(any(feature = "macos", feature = "freebsd"))]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 use libc::__error as errno_ptr;
 
 const FRAME_LEN: usize = 2048;

@@ -1,39 +1,19 @@
-#[cfg(not(any(
-    feature = "linux",
-    feature = "macos",
-    feature = "freebsd",
-    feature = "openbsd",
-    feature = "windows",
-)))]
-compile_error!(
-    "listen: enable exactly one OS feature: linux | macos | freebsd | openbsd | windows"
-);
+//! Per-OS backends, selected by the compile target (ADR-0008).
 
-#[cfg(any(
-    all(feature = "linux", feature = "macos"),
-    all(feature = "linux", feature = "freebsd"),
-    all(feature = "linux", feature = "openbsd"),
-    all(feature = "linux", feature = "windows"),
-    all(feature = "macos", feature = "freebsd"),
-    all(feature = "macos", feature = "openbsd"),
-    all(feature = "macos", feature = "windows"),
-    all(feature = "freebsd", feature = "openbsd"),
-    all(feature = "freebsd", feature = "windows"),
-    all(feature = "openbsd", feature = "windows"),
-))]
-compile_error!("listen: OS features are mutually exclusive; enable only one");
+#[cfg(not(target_os = "linux"))]
+compile_error!("listen: no OS backend for this target yet");
 
-#[cfg(feature = "linux")]
+#[cfg(target_os = "linux")]
 mod linux;
-#[cfg(feature = "linux")]
+#[cfg(target_os = "linux")]
 pub use linux::{Alloc, FILTER, Source, abort, entry};
 
-// #[cfg(any(feature = "macos", feature = "freebsd", feature = "openbsd"))]
+// #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
 // mod bsd;
-// #[cfg(any(feature = "macos", feature = "freebsd", feature = "openbsd"))]
+// #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
 // pub use bsd::{Alloc, FILTER, Source, abort, entry};
 
-// #[cfg(feature = "windows")]
+// #[cfg(windows)]
 // mod windows;
-// #[cfg(feature = "windows")]
+// #[cfg(windows)]
 // pub use windows::{Alloc, FILTER, Source, abort, entry};

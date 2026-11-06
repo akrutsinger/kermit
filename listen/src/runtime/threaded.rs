@@ -7,22 +7,12 @@
 //!   windows: windows-sys threads, direct per ADR-0002 (future; the module is
 //!            preserved as a seam, not yet reachable -- see `windows.rs`).
 
-#[cfg(any(
-    feature = "linux",
-    feature = "macos",
-    feature = "freebsd",
-    feature = "openbsd"
-))]
+#[cfg(unix)]
 mod pthread;
-#[cfg(any(
-    feature = "linux",
-    feature = "macos",
-    feature = "freebsd",
-    feature = "openbsd"
-))]
+#[cfg(unix)]
 pub use pthread::run;
 
-#[cfg(feature = "windows")]
+#[cfg(windows)]
 mod windows;
-#[cfg(feature = "windows")]
+#[cfg(windows)]
 pub use windows::run;
